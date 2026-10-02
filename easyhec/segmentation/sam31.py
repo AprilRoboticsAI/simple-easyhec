@@ -115,6 +115,19 @@ class Sam31Segmenter:
         if len(states) != 1:
             raise ValueError('Cannot find the detected object state for mask refinement')
         state = states[0]
+        # add_prompt extracts a detected object from a multi-object batch before
+        # refining it. That extraction creates a fresh state and drops the
+        # interaction flags below. Extract FIRST, then initialize the state that
+        # will actually receive the click (also preserves the object's logits).
+        if len(state['obj_ids']) > 1 and not self.model.tracker.per_obj_inference:
+            rank = self.model._get_gpu_id_by_obj_id(self.state, self.object_id)
+            if rank != self.model.rank:
+                raise ValueError('Still-image mask refinement requires the object on the local GPU')
+            self.model._extract_object_to_singleton_state(self.state, self.object_id, rank)
+            states = self.model._get_sam2_inference_states_by_obj_ids(self.state, [self.object_id])
+            if len(states) != 1 or states[0]['obj_ids'] != [self.object_id]:
+                raise ValueError('Cannot isolate the detected object for mask refinement')
+            state = states[0]
         index = state['obj_id_to_idx'][self.object_id]
         previous = state['output_dict']['cond_frame_outputs'].get(0, {}).get('pred_masks')
         if previous is None or previous.ndim != 4 or previous.shape[0] <= index:
@@ -278,6 +291,8 @@ def main():
         parser.error('--text must be nonempty')
     try:
         segment(args.dataset, args.checkpoint, args.overwrite, args.text)
+    except KeyboardInterrupt:
+        parser.exit(130, 'Annotation cancelled; previously accepted masks are saved.\n')
     except (ValueError, OSError, KeyError) as exc:
         parser.exit(1, f'easyhec SAM 3.1: {exc}\n')
 

@@ -98,8 +98,9 @@ class Sam31Tests(unittest.TestCase):
         state = {'cached_frame_outputs': {0: {'text_result': True}}}
         model = Mock()
         model.init_state.return_value = state
-        tracker_state = dict(obj_id_to_idx={7: 0, 9: 1}, frames_already_tracked={},
+        tracker_state = dict(obj_ids=[7, 9], obj_id_to_idx={7: 0, 9: 1}, frames_already_tracked={},
             output_dict={'cond_frame_outputs': {0: {'pred_masks': np.zeros((2, 1, 10, 20))}}})
+        model.tracker.per_obj_inference = True
         model._get_sam2_inference_states_by_obj_ids.return_value = [tracker_state]
 
         def prompt(**kwargs):
@@ -124,6 +125,46 @@ class Sam31Tests(unittest.TestCase):
             np.testing.assert_array_equal(adapter(image, [[10, 10, 1], [60, 10, -1]]), masks[0])
             self.assertEqual(adapter.object_id, 7)
             np.testing.assert_array_equal(adapter(image, []), masks[1])
+        finally:
+            adapter.close()
+
+    def test_batched_detection_is_extracted_before_initializing_mask_refinement(self):
+        image = np.zeros((40, 80, 3), np.uint8)
+        masks = np.zeros((2, 40, 80), bool)
+        masks[0, 5:35, 5:65] = True
+        masks[1, 5:10, 70:75] = True
+        prior = np.ones((1, 1, 10, 20))
+        batch = dict(obj_ids=[7, 9], obj_id_to_idx={7: 0, 9: 1}, frames_already_tracked={},
+                     output_dict={'cond_frame_outputs': {0: {'pred_masks': np.repeat(prior, 2, axis=0)}}})
+        singleton = dict(obj_ids=[7], obj_id_to_idx={7: 0}, frames_already_tracked={},
+                         user_refined_frames_per_obj={},
+                         output_dict={'cond_frame_outputs': {0: {'pred_masks': prior}}})
+        model = Mock(rank=0)
+        model.tracker.per_obj_inference = False
+        model.init_state.return_value = {'cached_frame_outputs': {}}
+        model._get_gpu_id_by_obj_id.return_value = 0
+        model._get_sam2_inference_states_by_obj_ids.return_value = [batch]
+
+        def extract(state, object_id, rank):
+            self.assertEqual((object_id, rank), (7, 0))
+            # Match upstream: extraction creates a new state without interaction flags.
+            self.assertFalse(batch['frames_already_tracked'])
+            model._get_sam2_inference_states_by_obj_ids.return_value = [singleton]
+
+        def prompt(**kwargs):
+            if 'text_str' not in kwargs:
+                model._extract_object_to_singleton_state.assert_called_once()
+                self.assertEqual(singleton['frames_already_tracked'], {0: {'reverse': False}})
+                self.assertEqual(singleton['user_refined_frames_per_obj'], {7: {0}})
+                self.assertIs(singleton['output_dict']['cond_frame_outputs'][0]['pred_masks'], prior)
+                self.assertTrue(model.tracker.model.iter_use_prev_mask_pred)
+            return 0, dict(out_obj_ids=[7, 9], out_probs=[.9, .5], out_binary_masks=masks)
+
+        model._extract_object_to_singleton_state.side_effect = extract
+        model.add_prompt.side_effect = prompt
+        adapter = segmentation.Sam31Segmenter(model, text='robot')
+        try:
+            np.testing.assert_array_equal(adapter(image, [[20, 20, 1]]), masks[0])
         finally:
             adapter.close()
 
@@ -172,6 +213,9 @@ class Sam31Tests(unittest.TestCase):
         adapter = segmentation.build_segmenter(text='robot')
         try:
             initial = adapter(image, []) > 0
+            if fixture.get('min_text_candidates'):
+                detected = adapter.state['tracker_metadata']['obj_ids_all_gpu']
+                self.assertGreaterEqual(len(detected), fixture['min_text_candidates'])
             px, py = fixture['positive_xy']
             nx, ny = fixture['negative_xy']
             self.assertTrue(initial[py, px] and initial[ny, nx])
