@@ -25,6 +25,7 @@ setup(
         "ninja>=1.11",
     ],
     extras_require={
+        "joint-offsets": ["pytorch-kinematics==0.10.0", "mujoco>=3.0.0"],
         "dev": [
             "black",
             "isort",

@@ -38,6 +38,33 @@ The code relies on Nvdiffrast which can sometimes be tricky to setup as it can h
 
 For those who don't want to manually segment their robot images you can use [SAM2](https://github.com/facebookresearch/sam2). Follow the installation instructions in that repo to set it up locally. Otherwise this repo provides a simple point annotation interface to annotate provided images with SAM2 to generate segmentation maps.
 
+## Joint-offset calibration
+
+Install the optional `joint-offsets` extra to use
+`easyhec.optim.kinematics.MujocoKinematics` and
+`easyhec.optim.joint_offsets.optimize_joint_offsets`. The original `optimize`
+API remains camera-only. The new optimizer accepts measured joint positions,
+a differentiable FK callable, and indices of joints to correct. It minimizes
+mean pixel silhouette error with bounded additive offsets and a zero-centered
+quadratic prior. Camera pose can be optimized jointly or held fixed.
+
+`MujocoKinematics(model, body_names, device='cuda')` builds a PyTorch Kinematics
+tree from compiled MuJoCo constants. Inputs follow its `joint_names` order; the
+output has shape `(frames, bodies, 4, 4)`. It handles fixed, hinge and slide
+bodies, including nonzero pivots and reference angles. Floating, ball, composite
+joints and mocap bodies are rejected. MuJoCo does not participate in autograd.
+
+The returned correction convention is `q_model = q_measured + offsets`.
+Unselected joints stay fixed. The caller must choose enough varied observations
+and suitable camera/base anchors; regularization does not resolve an underlying
+gauge ambiguity. Model, mounting and segmentation errors can bias fitted offsets.
+
+Run independent MuJoCo FK/gradient checks and synthetic GPU offset recovery:
+
+```bash
+MUJOCO_GL=egl RUN_EASYHEC_GPU=1 python -m unittest discover -s tests -p test_joint_offsets.py
+```
+
 ## SAM 3.1 segmentation
 
 This fork adds `easyhec.segmentation.sam31`: a SAM 3.1 backend for the existing

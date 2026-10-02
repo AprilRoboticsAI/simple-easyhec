@@ -83,7 +83,6 @@ def optimize(
         output = solver(batch)
         optimizer.zero_grad()
         output["mask_loss"].backward()
-        optimizer.step()
         loss_value = output["mask_loss"].item()
         if loss_value < best_loss:
             best_loss = loss_value
@@ -93,6 +92,8 @@ def optimize(
                 extrinsics.append(best_predicted_extrinsic)
         if i - last_loss_improvement_step >= early_stopping_steps:
             break
+        # Snapshot above must correspond to the evaluated loss, not the next step.
+        optimizer.step()
         if verbose:
             pbar.set_description(f"Loss: {loss_value:.2f}, Best Loss: {best_loss:.2f}")
         if "metrics" in output:
