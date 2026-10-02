@@ -1,0 +1,26 @@
+[project]
+name = "easyhec-sam31"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "sam3",
+    "easyhec==0.1.9",
+    "nvdiffrast", # EasyHeC checks this at import time, including for its UI.
+    "torch>=2.7",
+    "torchvision",
+    "numpy>=1.26,<2",
+    "opencv-python>=4.9,<4.12",
+    "einops",
+    "decord",
+    "pycocotools",
+    "psutil",
+    "setuptools<81", # Upstream SAM3 imports pkg_resources.
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+sam3 = { git = "https://github.com/facebookresearch/sam3.git", rev = "2345a4ad109ac29c569da749c91d84f10dc08c40" }
+easyhec = { path = "../..", editable = true }
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "20c4135fda78ae29d7658bea28b6c1d5b5e103e5" }

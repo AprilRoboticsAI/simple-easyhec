@@ -38,6 +38,83 @@ The code relies on Nvdiffrast which can sometimes be tricky to setup as it can h
 
 For those who don't want to manually segment their robot images you can use [SAM2](https://github.com/facebookresearch/sam2). Follow the installation instructions in that repo to set it up locally. Otherwise this repo provides a simple point annotation interface to annotate provided images with SAM2 to generate segmentation maps.
 
+## SAM 3.1 segmentation
+
+This fork adds `easyhec.segmentation.sam31`: a SAM 3.1 backend for the existing
+click interface, text initialization, and reviewed-mask persistence. The camera
+optimizer is unchanged. The backend, tests, and locked environment are maintained
+here independently of any robot deployment repository.
+
+From the repository root, supply a dataset directory with a `dataset.json`:
+
+```json
+{
+  "parts": ["base", "arm"],
+  "samples": [{"image": "images/000.png", "mask": "masks/000.png"}]
+}
+```
+
+Paths are relative to the dataset directory. Images must match the calibration
+intrinsics and masks must include only the listed calibration parts.
+
+```bash
+uv sync --project environments/sam31 --locked --python 3.12
+# Request access at https://huggingface.co/facebook/sam3.1, then authenticate locally:
+uv run --project environments/sam31 --locked hf auth login
+uv run --project environments/sam31 --locked python -m easyhec.segmentation.sam31 \
+  --dataset /path/to/dataset
+```
+
+The command uses a separate Python 3.12 environment with NumPy <2 as required by SAM3. Its dependencies and upstream
+source revision are locked in `environments/sam31`; that directory
+contains the environment definition and lockfile. SAM 3.1's multiplex predictor
+receives each capture as an independent still image; there is no video
+propagation between robot configurations. CUDA is required. The checkpoint downloads
+to the Hugging Face cache, or supply `--checkpoint /path/sam3.1_multiplex.pt`.
+
+Left-click adds foreground points; right-click adds background points. Press `t`
+to generate a mask, then `t` again to accept, `e` to edit, or `r` to reset.
+Accepted masks are saved immediately as binary PNGs, with model and click metadata
+alongside them. Existing masks are skipped; use `--overwrite` to review replacements.
+The camera solver consumes the same masks as before.
+
+To initialize the mask using text, then correct it with clicks:
+
+```bash
+uv run --project environments/sam31 --locked python -m easyhec.segmentation.sam31 \
+  --dataset /path/to/dataset --text "robot"
+```
+
+This mode opens directly on the text-generated preview. Press `t` to accept,
+or click / press `e` to edit, then `t` to regenerate and `t` again to accept.
+`r` restores the text-only mask; Escape or closing the window cancels the current
+image. SAM 3.1 detects objects from text first, then refines the selected object
+with positive/negative points in the same inference state. If text finds several
+instances, the highest-confidence instance is initially shown; positive clicks
+select the instance covering the most positive clicks, with confidence breaking
+ties. No detection produces an empty preview, requiring a different prompt.
+Text, selected object ID and clicks are saved with the mask. This mode also saves
+raw masks without speckle cleanup. Review whether a broad term like "robot"
+includes gloves or cables that are absent from the calibration geometry.
+The text detector's mask logits are supplied as the prior to point refinement,
+so clicking an arm corrects the existing robot mask. The adapter enables the
+pinned SAM3.1 tracker's mask-conditioned refinement path even for the first click;
+the upstream demo otherwise discards the initial mask on that first interaction.
+Each regeneration starts from the text mask plus all current clicks, so reset
+restores the text-only result and removed clicks cannot persist in the prediction.
+
+
+Run the regression tests from the repository root:
+
+```bash
+uv run --project environments/sam31 --locked python -m unittest discover -s tests -p test_sam31.py
+```
+
+These tests mock model inference and GUI input. The optional real-model test
+requires CUDA, checkpoint access, and `RUN_SAM31_FIXTURE=/path/to/fixture.json`.
+The fixture contains `image`, `positive_xy`, and `negative_xy`; both points must
+initially lie inside the text-detected robot on different parts.
+
 ## Usage
 
 We provide two real-world examples of this codebase. One with the low-cost [LeRobot SO100 Arm](#so100-arm), and another fun example with [letter/A sized paper](#paper) (e.g. A4) to calibrate real cameras. We further provide a [simulated example](#simulation) as well. While all these examples can be run with no additional code, for your own use-cases you are recommended to copy the example scripts and modify as needed. Scripts when copy-pasted should run with no python errors out of the box.
