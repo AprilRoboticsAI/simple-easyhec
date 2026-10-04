@@ -22,6 +22,8 @@ def optimize(
     early_stopping_steps: int = 200,
     verbose: bool = True,
     return_history: bool = False,
+    occluder_mesh=None,
+    render_batch_size: int = 1,
 ):
     """
     Optimizes an initial guess of a camera extrinsic using the camera intrinsic matrix, a dataset of robot masks, link poses relative to the robot base frame, and paths to the mesh files of each of the link poses.
@@ -42,12 +44,21 @@ def optimize(
         iterations (int): Number of optimization iterations
         learning_rate (float): Learning rate for the Adam optimizer
         batch_size (int): Default is None meaning whole batch optimization. Otherwise this specifies the number of samples to process in each batch.
+        render_batch_size (int): Maximum frames whose rendering graphs are held
+            simultaneously (default 1). Gradients accumulate over every selected
+            frame before one Adam update; this does not subsample the dataset.
         gt_camera_pose (torch.Tensor, shape (4, 4)): Default is None. If a ground truth camera pose is provided the optimization function will compute error metrics relative to the ground truth camera pose.
         early_stopping_steps (int): Default is 200. If the loss has not improved after this many steps the optimization will stop.
         verbose (bool): Default is True. If True, will print the loss value and a progress bar.
         return_history (bool): Default is False. If True, will return a list of all the current and previous best predicted extrinsics.
+        occluder_mesh: Optional trimesh mesh fixed in OpenCV camera coordinates,
+            shared by all frames. Occluded robot surfaces do not contribute to the mask.
     """
     device = initial_extrinsic_guess.device
+    nframes = len(masks)
+    if (nframes < 1 or not isinstance(render_batch_size, int) or render_batch_size < 1
+            or (batch_size is not None and (not isinstance(batch_size, int) or batch_size < 1))):
+        raise ValueError('Require at least one frame and positive integer batch sizes')
     cfg = RBSolverConfig(
         camera_width=camera_width,
         camera_height=camera_height,
@@ -55,6 +66,7 @@ def optimize(
         link_poses_dataset=link_poses_dataset,
         meshes=meshes,
         initial_extrinsic_guess=initial_extrinsic_guess,
+        occluder_mesh=occluder_mesh,
     )
     solver = RBSolver(cfg)
     solver = solver.to(device)
@@ -63,27 +75,29 @@ def optimize(
     best_loss = float("inf")
     last_loss_improvement_step = 0
     pbar = tqdm(range(iterations)) if verbose else range(iterations)
-    dataset = dict(
-        intrinsic=camera_intrinsic,
-        link_poses=link_poses_dataset,
-        mask=masks,
-        mount_poses=camera_mount_poses,
-    )
-    if gt_camera_pose is not None:
-        dataset["gt_camera_pose"] = gt_camera_pose
-
     if return_history:
         extrinsics = []
     for i in pbar:
-        if batch_size is None:
-            batch = dataset
-        else:
-            bid = torch.randperm(len(dataset["mask"]))[:batch_size]
-            batch = {k: v[bid] for k, v in dataset.items()}
-        output = solver(batch)
-        optimizer.zero_grad()
-        output["mask_loss"].backward()
-        loss_value = output["mask_loss"].item()
+        frame_ids = (torch.arange(nframes, device=masks.device) if batch_size is None else
+                     torch.randperm(nframes, device=masks.device)[:batch_size])
+        optimizer.zero_grad(set_to_none=True)
+        loss_value, metrics = 0., None
+        for start in range(0, len(frame_ids), render_batch_size):
+            bid = frame_ids[start:start + render_batch_size]
+            batch = dict(intrinsic=camera_intrinsic, link_poses=link_poses_dataset[bid],
+                         mask=masks[bid], record_history=start == 0)
+            if camera_mount_poses is not None:
+                batch['mount_poses'] = camera_mount_poses[bid]
+            if gt_camera_pose is not None:
+                batch['gt_camera_pose'] = gt_camera_pose
+            output = solver(batch)
+            # Weight the final, potentially smaller chunk by its frame count.
+            loss = output['mask_loss'] * (len(bid) / len(frame_ids))
+            loss_value += float(loss.detach())
+            loss.backward()
+            metrics = output.get('metrics')
+            # Release rendering outputs before constructing the next graph.
+            del loss, output, batch
         if loss_value < best_loss:
             best_loss = loss_value
             best_predicted_extrinsic = solver.get_predicted_extrinsic()
@@ -96,8 +110,8 @@ def optimize(
         optimizer.step()
         if verbose:
             pbar.set_description(f"Loss: {loss_value:.2f}, Best Loss: {best_loss:.2f}")
-        if "metrics" in output:
-            pbar.set_postfix(output["metrics"])
+        if verbose and metrics is not None:
+            pbar.set_postfix(metrics)
     if return_history:
         return torch.stack(extrinsics)
     else:

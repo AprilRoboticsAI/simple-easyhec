@@ -48,6 +48,13 @@ a differentiable FK callable, and indices of joints to correct. It minimizes
 mean pixel silhouette error with bounded additive offsets and a zero-centered
 quadratic prior. Camera pose can be optimized jointly or held fixed.
 
+Both optimizers default to `render_batch_size=1`: render and backpropagate one
+frame at a time, accumulate frame-count-weighted gradients over the selected
+dataset, then perform one Adam update. The offset prior is applied once per
+update. This preserves the full-data objective while bounding rendering graph
+memory independently of the number of recorded poses. Camera `batch_size`
+retains its separate optional random-subset behavior.
+
 `MujocoKinematics(model, body_names, device='cuda')` builds a PyTorch Kinematics
 tree from compiled MuJoCo constants. Inputs follow its `joint_names` order; the
 output has shape `(frames, bodies, 4, 4)`. It handles fixed, hinge and slide
@@ -120,9 +127,36 @@ with positive/negative points in the same inference state. If text finds several
 instances, the highest-confidence instance is initially shown; positive clicks
 select the instance covering the most positive clicks, with confidence breaking
 ties. No detection produces an empty preview, requiring a different prompt.
-Text, selected object ID and clicks are saved with the mask. This mode also saves
-raw masks without speckle cleanup. Review whether a broad term like "robot"
-includes gloves or cables that are absent from the calibration geometry.
+Text, selected object ID, clicks, cleanup settings and brush strokes are saved
+with the mask. Review whether a broad term like "robot" includes gloves or cables
+that are absent from the calibration geometry.
+
+Both text and point-only SAM 3.1 annotation use the same mask editor:
+
+| Key | Action |
+| --- | --- |
+| `b` | Toggle brush mode: **left-drag erases**, **right-drag restores/adds foreground**. |
+| `[` / `]` | Decrease/increase brush radius by 4 pixels (default 24, maximum 256); the cursor shows its size. |
+| `e` | Return to SAM point editing: left-click positive, right-click negative. |
+| `u` | Undo the last action (up to 32 actions; a drag is one action). |
+| `v` | Compare the latest raw SAM mask with the edited preview. |
+| `t` | Regenerate if prompts are pending; otherwise accept the edited mask. |
+| `r` | Reset prompts and brush edits; undo can restore them. |
+| Escape / close | Cancel this image without saving it. |
+
+Cleanup is **always applied**: remove selected islands smaller than 32 pixels,
+fill enclosed holes up to 128 pixels, and open gently with a 5×5 ellipse.
+There are no filter toggles. Border-connected background and larger holes stay
+open; island removal retains larger disconnected parts and positively seeded islands.
+Parameters are in native image pixels, chosen for the 1280×800 OAK captures.
+Cleanup runs in order: hole filling, opening, island removal. Brush strokes apply
+last and survive SAM regeneration. A restore stroke can
+therefore deliberately keep a small component, and an erase stroke stays erased
+despite automatic hole filling. `v` is read-only; pressing `t` while comparing
+first returns to the edited preview, requiring another `t` to accept. Existing
+masks remain untouched until acceptance with `--overwrite`. These controls do
+not change the SAM 2 upstream UI.
+
 The text detector's mask logits are supplied as the prior to point refinement,
 so clicking an arm corrects the existing robot mask. The adapter enables the
 pinned SAM3.1 tracker's mask-conditioned refinement path even for the first click;

@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from easyhec.segmentation import sam31 as segmentation
+from easyhec.segmentation.mask_editor import MaskEditor
 
 
 @unittest.skipUnless(importlib.util.find_spec('torch') and importlib.util.find_spec('easyhec'),
@@ -64,9 +65,6 @@ class Sam31Tests(unittest.TestCase):
             adapter.close()
 
     def test_save_reviewed_masks_skip_existing_and_explicit_overwrite(self):
-        # Use the real upstream UI class with only its interactive loop replaced.
-        from easyhec.segmentation.interactive import InteractiveSegmentation
-
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cv2.imwrite(str(root/'image.png'), np.zeros((40, 80, 3), np.uint8))
@@ -77,9 +75,9 @@ class Sam31Tests(unittest.TestCase):
             cv2.imwrite(str(root/'mask.png'), old)
             (root/'dataset.json').write_text(json.dumps(dict(parts=['base'], samples=[
                 dict(image='image.png', mask='mask.png')])))
-            adapter = Mock(points=[[15, 15, 1]])
+            adapter = Mock(points=[[15, 15, 1]], review_metadata={"version": 1, "strokes": []})
             with patch.object(segmentation, 'build_segmenter', return_value=adapter) as build, \
-                 patch.object(InteractiveSegmentation, 'get_segmentation', return_value=new[None]):
+                 patch.object(segmentation, 'review_text_mask', return_value=new):
                 segmentation.segment(root)
                 build.assert_not_called()
                 np.testing.assert_array_equal(cv2.imread(str(root/'mask.png'), 0), old)
@@ -87,6 +85,7 @@ class Sam31Tests(unittest.TestCase):
                 np.testing.assert_array_equal(cv2.imread(str(root/'mask.png'), 0), new*255)
                 metadata = json.loads((root/'mask.json').read_text())
                 self.assertEqual(metadata['model'], 'sam3.1')
+                self.assertEqual(metadata['mask_review'], adapter.review_metadata)
                 self.assertEqual(metadata['clicks_xy_label'], [[15, 15, 1]])
                 adapter.close.assert_called_once()
 
@@ -199,8 +198,8 @@ class Sam31Tests(unittest.TestCase):
         with patch.multiple(segmentation.cv2, namedWindow=Mock(), resizeWindow=Mock(),
                 setMouseCallback=lambda window, callback: callbacks.update(click=callback),
                 imshow=Mock(), waitKey=key, getWindowProperty=Mock(return_value=1),
-                destroyAllWindows=Mock()):
-            np.testing.assert_array_equal(segmentation.review_text_mask(image, adapter), refined)
+                destroyWindow=Mock()):
+            np.testing.assert_array_equal(segmentation.review_text_mask(image, adapter), MaskEditor(refined).result())
         self.assertEqual(adapter.call_count, 2)
         self.assertEqual(adapter.call_args.args[1], [(10, 10, 1)])
 
