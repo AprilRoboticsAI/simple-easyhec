@@ -115,6 +115,19 @@ class Sam31Segmenter:
         if len(states) != 1:
             raise ValueError('Cannot find the detected object state for mask refinement')
         state = states[0]
+        # add_prompt extracts a detected object from a multi-object batch before
+        # refining it. That extraction creates a fresh state and drops the
+        # interaction flags below. Extract FIRST, then initialize the state that
+        # will actually receive the click (also preserves the object's logits).
+        if len(state['obj_ids']) > 1 and not self.model.tracker.per_obj_inference:
+            rank = self.model._get_gpu_id_by_obj_id(self.state, self.object_id)
+            if rank != self.model.rank:
+                raise ValueError('Still-image mask refinement requires the object on the local GPU')
+            self.model._extract_object_to_singleton_state(self.state, self.object_id, rank)
+            states = self.model._get_sam2_inference_states_by_obj_ids(self.state, [self.object_id])
+            if len(states) != 1 or states[0]['obj_ids'] != [self.object_id]:
+                raise ValueError('Cannot isolate the detected object for mask refinement')
+            state = states[0]
         index = state['obj_id_to_idx'][self.object_id]
         previous = state['output_dict']['cond_frame_outputs'].get(0, {}).get('pred_masks')
         if previous is None or previous.ndim != 4 or previous.shape[0] <= index:
@@ -180,51 +193,10 @@ def build_segmenter(checkpoint=None, text=None):
 
 
 def review_text_mask(image, segmenter):
-    """Text-first preview with the same click/t/e/r controls as upstream."""
-    window = f'SAM 3.1: {segmenter.text} | t: accept, click/e: edit, r: reset, Esc: cancel'
-    points = []
-    reviewing = True
-    mask = segmenter(image, [])
+    """Shared cleanup/brush review for text- and point-initialized SAM masks."""
+    from easyhec.segmentation.mask_editor import review_mask
 
-    def click(event, x, y, flags, param):
-        nonlocal reviewing
-        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
-            points.append((x, y, 1 if event == cv2.EVENT_LBUTTONDOWN else -1))
-            reviewing = False
-
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, image.shape[1], image.shape[0])
-    cv2.setMouseCallback(window, click)
-    print('Text preview ready. t: accept; click/e: edit; t after editing: regenerate; r: reset; Esc: cancel.')
-    try:
-        while True:
-            display = image.copy()
-            selected = mask > 0
-            display[selected] = (.55*display[selected] + .45*np.array([40, 230, 40])).astype(np.uint8)
-            for x, y, label in points:
-                cv2.circle(display, (x, y), 5, (40, 230, 40) if label > 0 else (230, 40, 40), -1)
-            status = 'PREVIEW: t accepts' if reviewing else 'EDITING: t regenerates'
-            cv2.putText(display, status, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, .7, (255, 80, 40), 2)
-            cv2.imshow(window, cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
-            key = cv2.waitKey(20) & 0xff
-            if key == 27 or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                raise ValueError('Annotation cancelled; current mask was not saved')
-            if key == ord('t'):
-                if reviewing:
-                    if mask.any():
-                        return mask
-                    print('Cannot accept an empty mask; cancel and try a different text prompt.')
-                else:
-                    mask = segmenter(image, points)
-                    reviewing = True
-            elif key == ord('e'):
-                reviewing = False
-            elif key == ord('r'):
-                points.clear()
-                mask = segmenter(image, [])
-                reviewing = True
-    finally:
-        cv2.destroyAllWindows()
+    return review_mask(image, segmenter)
 
 
 def segment(dataset, checkpoint=None, overwrite=False, text=None):
@@ -235,9 +207,6 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None):
         return
     segmenter = build_segmenter(checkpoint, text=text)
     try:
-        from easyhec.segmentation.interactive import InteractiveSegmentation
-
-        tool = InteractiveSegmentation(segmentation_model=segmenter)
         print('SAM 3.1: select only', ', '.join(doc['parts']),
               '(exclude objects outside the calibration geometry).')
         for index, sample in enumerate(samples):
@@ -246,8 +215,7 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None):
                 raise ValueError(f'Cannot read {sample["image"]}')
             print(f'Image {index + 1}/{len(samples)}: {sample["image"]}')
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            mask = (review_text_mask(rgb, segmenter) if text else
-                    tool.get_segmentation(rgb[None])[0])
+            mask = review_text_mask(rgb, segmenter)
             path = dataset / sample['mask']
             path.parent.mkdir(parents=True, exist_ok=True)
             # Save each reviewed frame immediately; an interrupted session can resume.
@@ -260,7 +228,8 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None):
                 checkpoint_revision=None if checkpoint else SAM31_CHECKPOINT_REVISION,
                 text_prompt=text, object_id=segmenter.object_id if text else 1,
                 refinement='text_mask_and_points' if text else 'points_only',
-                image=sample['image'], clicks_xy_label=segmenter.points)
+                image=sample['image'], clicks_xy_label=segmenter.points,
+                mask_review=segmenter.review_metadata)
             path.with_suffix('.json').write_text(json.dumps(provenance, indent=2) + '\n')
             print(f'Saved {path}')
     finally:
@@ -278,6 +247,8 @@ def main():
         parser.error('--text must be nonempty')
     try:
         segment(args.dataset, args.checkpoint, args.overwrite, args.text)
+    except KeyboardInterrupt:
+        parser.exit(130, 'Annotation cancelled; previously accepted masks are saved.\n')
     except (ValueError, OSError, KeyError) as exc:
         parser.exit(1, f'easyhec SAM 3.1: {exc}\n')
 
