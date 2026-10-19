@@ -101,6 +101,52 @@ class Sam31Segmenter:
         # Empty output is valid (e.g. negative-only prompts); UI allows editing.
         return np.any(masks[ids == self.object_id], axis=0).astype(np.uint8)
 
+    def detect_objects(self, texts):
+        """Detect all instances on the loaded image, preserving robot prompt metadata."""
+        import torch
+
+        if self.image is None:
+            raise ValueError('Generate a robot mask before detecting other objects')
+        objects = []
+        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+            for text in texts:
+                self.model.reset_state(self.state)
+                _, output = self.model.add_prompt(
+                    inference_state=self.state, frame_idx=0, text_str=text)
+                masks, _ = self._masks(output, *self.image.shape[:2])
+                objects.extend(masks)
+        return objects
+
+    def detect_exclusions(self, texts, robot):
+        """Supplement cable text detections with automatic local point prompts."""
+        from .image_cleanup import cable_loop_candidates, local_cable_prediction
+
+        objects = self.detect_objects(texts)
+        if not any('cable' in text.lower() or 'wire' in text.lower() for text in texts):
+            return objects
+        # Share the loaded frame, but keep automatic points out of user metadata.
+        # Every call resets the inference state, as does subsequent user refinement.
+        local = Sam31Segmenter(self.model)
+        local.image, local.state = self.image, self.state
+        attempts = 0
+        try:
+            for point, region in cable_loop_candidates(robot):
+                # Already detected loops need no extra inference.
+                x, y = point
+                if any(obj[y, x] for obj in objects):
+                    continue
+                if attempts >= 6:
+                    break
+                attempts += 1
+                mask = local(self.image, [[x, y, 1]]) > 0
+                if local_cable_prediction(mask, point, region, robot):
+                    # A cable can continue across the robot or into the room.
+                    # Only the local loop prompted by the mask is an exclusion.
+                    objects.append(mask & region)
+        finally:
+            local.close()
+        return objects
+
     def _use_detected_mask_for_refinement(self):
         """Keep the text mask as the prior for the first click on this still.
 
@@ -199,13 +245,22 @@ def review_text_mask(image, segmenter):
     return review_mask(image, segmenter)
 
 
-def segment(dataset, checkpoint=None, overwrite=False, text=None):
+def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=False,
+            include_text=None, exclude_text=None):
     doc = json.loads((dataset / 'dataset.json').read_text())
     samples = [s for s in doc['samples'] if overwrite or not (dataset / s['mask']).exists()]
     if not samples:
         print('All samples already have masks; use --overwrite to review replacements')
         return
+    if image_cleanup and not text:
+        raise ValueError('Image cleanup requires a robot text prompt')
     segmenter = build_segmenter(checkpoint, text=text)
+    segmenter.cleanup_prompts = None
+    if image_cleanup:
+        segmenter.cleanup_prompts = dict(
+            include=(include_text if include_text is not None else
+                     ['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else []),
+            exclude=exclude_text if exclude_text is not None else ['cable'])
     try:
         print('SAM 3.1: select only', ', '.join(doc['parts']),
               '(exclude objects outside the calibration geometry).')
@@ -241,12 +296,16 @@ def main():
     parser.add_argument('--dataset', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--image-cleanup', action='store_true')
+    parser.add_argument('--include-text', nargs='+')
+    parser.add_argument('--exclude-text', nargs='+')
     parser.add_argument('--text', help='Find an object by text, then refine it with clicks')
     args = parser.parse_args()
     if args.text is not None and not args.text.strip():
         parser.error('--text must be nonempty')
     try:
-        segment(args.dataset, args.checkpoint, args.overwrite, args.text)
+        segment(args.dataset, args.checkpoint, args.overwrite, args.text,
+                args.image_cleanup, args.include_text, args.exclude_text)
     except KeyboardInterrupt:
         parser.exit(130, 'Annotation cancelled; previously accepted masks are saved.\n')
     except (ValueError, OSError, KeyError) as exc:

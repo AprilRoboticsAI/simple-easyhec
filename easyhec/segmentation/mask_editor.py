@@ -30,7 +30,7 @@ class MaskEditor:
     Undo snapshots are bounded to 32 user actions. Stroke coordinates are saved
     for provenance/replay, with radii in original image pixels.
     """
-    def __init__(self, mask, object_id=None, pending=False):
+    def __init__(self, mask, object_id=None, pending=False, cleanup=None):
         self.raw = (mask > 0).copy()
         self.object_id = object_id
         self.points = []
@@ -39,18 +39,23 @@ class MaskEditor:
         self.strokes = []
         self.history = []
         self._cache = None
+        self.cleanup = cleanup
+        self.auto_enabled = cleanup is not None
+        self.auto_metadata = None
+        self.auto_added = np.zeros_like(self.raw)
+        self.auto_removed = np.zeros_like(self.raw)
 
     def checkpoint(self):
         self.history.append((self.raw.copy(), self.overrides.copy(), self.object_id,
                              deepcopy(self.points), self.pending,
-                             deepcopy(self.strokes)))
+                             deepcopy(self.strokes), self.auto_enabled))
         del self.history[:-32]
         self._cache = None
 
     def undo(self):
         if self.history:
             (self.raw, self.overrides, self.object_id, self.points, self.pending,
-             self.strokes) = self.history.pop()
+             self.strokes, self.auto_enabled) = self.history.pop()
             self._cache = None
 
     def add_point(self, x, y, label):
@@ -98,13 +103,25 @@ class MaskEditor:
             result = cv2.morphologyEx(result.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
             seeds = [(x, y) for x, y, label in self.points if label > 0]
             result = remove_small_islands(result, foreground_points=seeds)
+            if self.cleanup is not None:
+                from easyhec.segmentation.image_cleanup import compose_mask
+
+                composed, self.auto_metadata = compose_mask(
+                    result, self.cleanup['additions'], self.cleanup['exclusions'])
+                self.auto_added = composed & ~result
+                self.auto_removed = result & ~composed
+                if self.auto_enabled:
+                    result = composed
             manual = self.overrides >= 0
             result[manual] = self.overrides[manual] > 0
             self._cache = result
         return self._cache.copy()
 
     def metadata(self):
-        return dict(version=1, cleanup=dict(islands=True, holes=True, opening=True, min_island_area_px=32,
+        self.result()
+        automatic = None if self.cleanup is None else dict(
+            self.auto_metadata, enabled=self.auto_enabled, prompts=self.cleanup['prompts'])
+        return dict(version=2, image_cleanup=automatic, cleanup=dict(islands=True, holes=True, opening=True, min_island_area_px=32,
                     max_hole_area_px=128, opening_radius_px=2),
                     cleanup_order=['holes', 'opening', 'islands'],
                     brush_applied_after_cleanup=True, strokes=deepcopy(self.strokes))
@@ -114,7 +131,15 @@ def review_mask(image, segmenter):
     """Review either text- or point-initialized SAM masks in a single window."""
     text = segmenter.text
     initial = segmenter(image, []) if text else np.zeros(image.shape[:2], np.uint8)
-    editor = MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text))
+    prompts = getattr(segmenter, 'cleanup_prompts', None)
+    cleanup = None
+    if isinstance(prompts, dict):
+        cleanup = dict(prompts=prompts,
+                       additions=segmenter.detect_objects(prompts['include']),
+                       exclusions=segmenter.detect_exclusions(prompts['exclude'], initial))
+    editor = MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text),
+                        cleanup=cleanup)
+    show_changes = False
     window = 'SAM 3.1 mask review'
     brush_mode, original = False, False
     radius, cursor, dragging = 24, None, False
@@ -145,13 +170,18 @@ def review_mask(image, segmenter):
     cv2.resizeWindow(window, image.shape[1], image.shape[0])
     cv2.setMouseCallback(window, click)
     print('t: generate/accept; e: SAM clicks; b: brush (left erase, right restore); '
-          '[/]: brush size; cleanup is automatic; '
+          '[/]: brush size; a: image cleanup on/off; d: show additions/removals; '
           'u: undo; v: raw SAM comparison; r: reset all edits; Esc: cancel.')
     try:
         while True:
             display = image.copy()
             selected = editor.raw if original else editor.result()
             display[selected] = (.55 * display[selected] + .45 * np.array([40, 230, 40])).astype(np.uint8)
+            if show_changes and not original and editor.auto_enabled:
+                added = editor.auto_added & selected
+                removed = editor.auto_removed & ~selected
+                display[added] = (.4 * display[added] + .6 * np.array([40, 220, 255])).astype(np.uint8)
+                display[removed] = (.4 * display[removed] + .6 * np.array([230, 40, 230])).astype(np.uint8)
             if not original:
                 for x, y, label in editor.points:
                     cv2.circle(display, (x, y), 4, (40, 230, 40) if label > 0 else (230, 40, 40), -1)
@@ -160,8 +190,11 @@ def review_mask(image, segmenter):
             status = ('RAW SAM - v: edited preview' if original else
                       't: regenerate SAM (pending clicks)' if editor.pending else 't: accept mask')
             mode = f'BRUSH: left erase / right restore, radius {radius}px [ / ]' if brush_mode else 'SAM: left positive / right negative'
-            cleanup = 'Auto cleanup: small islands, small holes, gentle opening'
-            for row, line in enumerate([status, mode, cleanup, 'b: brush | e: clicks | u: undo | v: compare | r: reset | Esc: cancel']):
+            cleanup_status = 'Auto cleanup: small islands, small holes, gentle opening'
+            if editor.cleanup is not None:
+                cleanup_status = ('a: image cleanup ' + ('ON' if editor.auto_enabled else 'OFF')
+                                  + ' | d: changes (cyan added, magenta removed)')
+            for row, line in enumerate([status, mode, cleanup_status, 'b: brush | e: clicks | u: undo | v: compare | r: reset | Esc: cancel']):
                 y = 23 + row * 24
                 cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
                 cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
@@ -179,7 +212,12 @@ def review_mask(image, segmenter):
                 # Return to the edited preview before any action, especially accept.
                 original = False
                 continue
-            if key == ord('t'):
+            if key == ord('d') and editor.cleanup is not None:
+                show_changes = not show_changes
+            elif key == ord('a') and editor.cleanup is not None:
+                editor.checkpoint()
+                editor.auto_enabled = not editor.auto_enabled
+            elif key == ord('t'):
                 if editor.pending:
                     if not text and not editor.points:
                         print('Add a SAM point before generating a mask.')

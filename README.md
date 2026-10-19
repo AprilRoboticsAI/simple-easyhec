@@ -137,12 +137,41 @@ Both text and point-only SAM 3.1 annotation use the same mask editor:
 | --- | --- |
 | `b` | Toggle brush mode: **left-drag erases**, **right-drag restores/adds foreground**. |
 | `[` / `]` | Decrease/increase brush radius by 4 pixels (default 24, maximum 256); the cursor shows its size. |
+| `a` | With image cleanup: toggle automatic additions and removals (undoable). |
+| `d` | With image cleanup: highlight additions in cyan and removals in magenta. |
 | `e` | Return to SAM point editing: left-click positive, right-click negative. |
 | `u` | Undo the last action (up to 32 actions; a drag is one action). |
 | `v` | Compare the latest raw SAM mask with the edited preview. |
 | `t` | Regenerate if prompts are pending; otherwise accept the edited mask. |
 | `r` | Reset prompts and brush edits; undo can restore them. |
 | Escape / close | Cancel this image without saving it. |
+
+Use `--image-cleanup` for image-only foreground composition. The default extra
+foreground prompts are `vertical metal support` and `black vertical post` for
+datasets containing `base`; the default exclusion is `cable`. Override with
+`--include-text` and `--exclude-text`. This requires text initialization and
+uses no robot reprojection or camera estimate. For cable/wire exclusion prompts,
+thin enclosures around small background gaps supply up to six automatic SAM
+point prompts. Already detected loops are skipped. Point predictions must stay
+local (at least half within the enclosure neighborhood), narrow (at most a 14-pixel
+inscribed radius at 1280-pixel width), and below 3% of the robot-mask area.
+Only predicted pixels within that neighborhood are removed. The shape heuristic
+only proposes clicks; SAM supplies the removed pixels.
+Automatic points do not change the user's clicks or selected robot instance.
+Cable cuts are restored only
+within the pre-subtraction mask using local closing. Small body cavities require
+72% foreground support in a surrounding band; new pixels near removed cables
+are excluded. Repair size limits scale with image resolution and are recorded
+in metadata. This is conservative mask repair, not a guarantee that every
+interior/background ambiguity is resolved. All detected instances are
+considered; remote additions and excessive changes are skipped. Manual brush
+edits apply after composition. The robot instance itself is still selected by
+the existing text/confidence/positive-click rules.
+
+Run `experiments/evaluate_image_cleanup.py --dataset DIR --output NEW_DIR`
+in the SAM environment for before/after images, change overlays, a gallery and
+per-frame diagnostics. It writes only the new output directory and never
+changes dataset masks.
 
 Cleanup is **always applied**: remove selected islands smaller than 32 pixels,
 fill enclosed holes up to 128 pixels, and open gently with a 5×5 ellipse.
