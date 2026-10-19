@@ -52,6 +52,29 @@ class Sam31Tests(unittest.TestCase):
         self.assertIsNone(adapter.state)
         self.assertFalse(Path(adapter.temp.name).exists())
 
+    def test_object_detection_returns_all_instances_without_changing_robot_metadata(self):
+        model = Mock()
+        masks = np.zeros((2, 40, 80), bool)
+        masks[0, 2:5, 2:10] = True
+        masks[1, 10:15, 30:40] = True
+        model.add_prompt.side_effect = [
+            (0, dict(out_obj_ids=[3, 8], out_binary_masks=masks)),
+            (0, dict(out_obj_ids=[], out_binary_masks=np.zeros((0, 40, 80), bool))),
+        ]
+        adapter = segmentation.Sam31Segmenter(model, text='robot')
+        adapter.image = np.zeros((40, 80, 3), np.uint8)
+        adapter.state = {}
+        adapter.points = [[20, 10, 1]]
+        adapter.object_id = 7
+        try:
+            np.testing.assert_array_equal(adapter.detect_objects(['support', 'cable']), masks)
+            self.assertEqual(model.reset_state.call_count, 2)
+            self.assertEqual(adapter.points, [[20, 10, 1]])
+            self.assertEqual(adapter.object_id, 7)
+            self.assertEqual(adapter.text, 'robot')
+        finally:
+            adapter.close()
+
     def test_empty_output_keeps_full_image_dimensions(self):
         model = Mock()
         model.init_state.return_value = {'cached_frame_outputs': {}}
@@ -61,6 +84,37 @@ class Sam31Tests(unittest.TestCase):
             mask = adapter(np.zeros((40, 80, 3), np.uint8), [[10, 10, -1]])
             self.assertEqual(mask.shape, (40, 80))
             self.assertFalse(mask.any())
+        finally:
+            adapter.close()
+
+    def test_automatic_cable_points_preserve_user_metadata_and_reset_state(self):
+        image = np.zeros((100, 100, 3), np.uint8)
+        mask = np.zeros((100, 100), bool)
+        mask[48:52, 42:58] = True
+        prediction = mask.copy()
+        prediction[5:7, 5:15] = True  # Remote continuation must be clipped.
+        region = np.zeros_like(mask)
+        region[40:60, 40:60] = True
+        model = Mock()
+        model.add_prompt.side_effect = [
+            (0, dict(out_obj_ids=[], out_binary_masks=np.zeros((0, 100, 100), bool))),
+            (0, dict(out_obj_ids=[1], out_binary_masks=prediction[None])),
+        ]
+        adapter = segmentation.Sam31Segmenter(model, text='robot')
+        adapter.image, adapter.state = image, {'cached_frame_outputs': {}}
+        adapter.points, adapter.object_id = [[10, 10, 1]], 7
+        try:
+            with patch('easyhec.segmentation.image_cleanup.cable_loop_candidates',
+                       return_value=[((50, 50), region)]):
+                result = adapter.detect_exclusions(['cable'], np.ones_like(mask))
+            np.testing.assert_array_equal(result, mask[None])
+            self.assertEqual(adapter.points, [[10, 10, 1]])
+            self.assertEqual(adapter.object_id, 7)
+            self.assertEqual(adapter.text, 'robot')
+            self.assertEqual(model.reset_state.call_count, 2)
+            np.testing.assert_array_equal(model.add_prompt.call_args.kwargs['points'], [[.5, .5]])
+            self.assertIsNotNone(adapter.state)
+            model.init_state.assert_not_called()
         finally:
             adapter.close()
 
