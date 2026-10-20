@@ -13,6 +13,26 @@ from easyhec.segmentation import sam31
 
 
 class CleanupTests(unittest.TestCase):
+    def test_reject_persists_and_overwrite_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cv2.imwrite(str(root / 'image.png'), np.zeros((40, 80, 3), np.uint8))
+            (root / 'dataset.json').write_text(json.dumps(dict(parts=['base'], samples=[
+                dict(image='image.png', mask='mask.png')])))
+            adapter = Mock(points=[], review_metadata={})
+            with patch.object(sam31, 'build_segmenter', return_value=adapter), \
+                 patch.object(sam31, 'review_text_mask', return_value=None) as review:
+                sam31.segment(root)
+                self.assertTrue((root / 'mask.rejected.json').exists())
+                sam31.segment(root)
+                self.assertEqual(review.call_count, 1)
+                mask = np.zeros((40, 80), np.uint8)
+                mask[10:20, 10:20] = 1
+                review.return_value = mask
+                sam31.segment(root, overwrite=True)
+                self.assertFalse((root / 'mask.rejected.json').exists())
+                np.testing.assert_array_equal(cv2.imread(str(root / 'mask.png'), 0), mask * 255)
+
     def test_islands_preserve_large_disconnected_parts_and_positive_seed(self):
         mask = np.zeros((80, 120), bool)
         mask[10:30, 10:30] = True

@@ -185,7 +185,7 @@ def review_mask(image, segmenter):
     cv2.setMouseCallback(window, click)
     print('t: generate/accept; e: SAM clicks; b: brush (left erase, right restore); '
           '[/]: brush size; a: image cleanup on/off; d: show additions/removals; '
-          'u: undo; v: raw SAM comparison; r: reset all edits; Esc: cancel.')
+          'u: undo; v: raw SAM comparison; r: reset all edits; x: reject image; Esc: cancel.')
     try:
         while True:
             display = image.copy()
@@ -208,7 +208,7 @@ def review_mask(image, segmenter):
             if editor.cleanup is not None:
                 cleanup_status = ('a: image cleanup ' + ('ON' if editor.auto_enabled else 'OFF')
                                   + ' | d: changes (cyan added, magenta removed)')
-            for row, line in enumerate([status, mode, cleanup_status, 'b: brush | e: clicks | u: undo | v: compare | r: reset | Esc: cancel']):
+            for row, line in enumerate([status, mode, cleanup_status, 'b: brush | e: clicks | u: undo | v: compare | r: reset | x: reject image | Esc: cancel']):
                 y = 23 + row * 24
                 cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 0), 3)
                 cv2.putText(display, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
@@ -218,6 +218,8 @@ def review_mask(image, segmenter):
                 raise ValueError('Annotation cancelled; current mask was not saved')
             if key == 255:
                 continue
+            if key == ord('x'):
+                return None
             dragging = False
             if key == ord('v'):
                 original = not original
