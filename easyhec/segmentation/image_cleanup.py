@@ -67,14 +67,60 @@ def local_cable_prediction(mask, point, region, robot):
             <= max(2, 14 * mask.shape[1] / 1280))
 
 
-def repair_silhouette(foreground, excluded):
-    """Keep cable crossings inside solid parts and repair supported body cavities.
+def cable_crop_boxes(robot, cables):
+    """Zoom into detected cable clusters near the selected robot, not background."""
+    scale = robot.shape[1] / 1280
+    radius, padding = max(1, round(24*scale)), max(1, round(64*scale))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)
+    near = cv2.dilate(robot.astype(np.uint8), kernel) > 0
+    seed = np.zeros_like(robot, dtype=bool)
+    for cable in cables:
+        cable = np.asarray(cable, bool)
+        if cable.shape != robot.shape:
+            raise ValueError('Cable and robot dimensions must match')
+        seed |= cable & near
+    clusters = cv2.dilate(seed.astype(np.uint8), kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(clusters, 8)
+    boxes = []
+    for index in sorted(range(1, count), key=lambda i: stats[i, 4], reverse=True):
+        x, y, w, h, _ = stats[index]
+        if np.count_nonzero(seed & (labels == index)) < 40*scale**2:
+            continue
+        x0, y0 = max(0, x-padding), max(0, y-padding)
+        x1, y1 = min(robot.shape[1], x+w+padding), min(robot.shape[0], y+h+padding)
+        if x1-x0 > .65*robot.shape[1] or y1-y0 > .8*robot.shape[0]:
+            continue
+        boxes.append((x0, y0, x1, y1))
+    return boxes[:6]
 
-    Closing is only a proposal: restoring a cable cut is restricted to the
-    pre-subtraction mask. New foreground requires a small connected cavity with
-    at least 72% foreground support in a surrounding band. This prevents global
-    hole filling from turning cable loops or narrow finger gaps into foreground.
-    Parameters scale from 1280-pixel images; no pose or rendering is involved.
+
+def hand_envelopes(robot, hands):
+    """Protect each selected robot hand's convex envelope, including finger gaps."""
+    protected = np.zeros_like(robot, dtype=bool)
+    accepted = 0
+    radius = max(1, round(12 * robot.shape[1] / 1280))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)
+    for hand in hands:
+        hand = np.asarray(hand, bool)
+        if hand.shape != robot.shape:
+            raise ValueError('Hand and robot dimensions must match')
+        area = hand.sum()
+        # Ignore hands belonging to another robot (e.g. on the monitor).
+        if not area or np.count_nonzero(hand & robot) < .5 * area:
+            continue
+        points = cv2.findNonZero(hand.astype(np.uint8))
+        envelope = np.zeros_like(robot, dtype=np.uint8)
+        cv2.fillConvexPoly(envelope, cv2.convexHull(points), 1)
+        protected |= cv2.dilate(envelope, kernel) > 0
+        accepted += 1
+    return protected, accepted
+
+
+def repair_silhouette(foreground, excluded, protected=None):
+    """Repair supported body cavities only outside detected hand envelopes.
+
+    Without semantic protection, only restore cable cuts within the input mask.
+    Hand envelopes include background gaps, so curled fingers stay separate.
     """
     foreground, excluded = np.asarray(foreground, bool), np.asarray(excluded, bool)
     if foreground.ndim != 2 or excluded.shape != foreground.shape:
@@ -88,8 +134,17 @@ def repair_silhouette(foreground, excluded):
     padded = np.pad(cut.astype(np.uint8), radius + 1)
     closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, kernel)
     closed = closed[radius+1:-(radius+1), radius+1:-(radius+1)] > 0
-    restored = closed & foreground & excluded
+    # Closing alone reconnects exposed cables near wrists. Restore crossings
+    # only inside solid foreground, away from the original silhouette edge.
+    interior = cv2.distanceTransform(foreground.astype(np.uint8), cv2.DIST_L2, 5)
+    restored = closed & foreground & excluded & (interior > max(1, 4*scale))
     result = cut | restored
+    if protected is None:
+        return result, dict(cable_crossing_px=int(restored.sum()), body_repair_px=0,
+                            closing_radius_px=radius, body_repair_enabled=False)
+    protected = np.asarray(protected, bool)
+    if protected.shape != foreground.shape:
+        raise ValueError('Protected region and foreground dimensions must match')
     _, labels, stats, _ = cv2.connectedComponentsWithStats((~closed).astype(np.uint8), 8)
     fill = stats[:, cv2.CC_STAT_AREA] <= max_area
     fill[np.unique(np.r_[0, labels[0], labels[-1], labels[:, 0], labels[:, -1]])] = False
@@ -97,7 +152,7 @@ def repair_silhouette(foreground, excluded):
     # Do not create new foreground in the background enclosed by cable loops.
     # Cable crossings already present in the mask were restored above.
     cable_neighborhood = cv2.dilate(excluded.astype(np.uint8), kernel) > 0
-    candidates &= ~cable_neighborhood
+    candidates &= ~cable_neighborhood & ~protected
     count, labels, stats, _ = cv2.connectedComponentsWithStats(candidates.astype(np.uint8), 8)
     ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*band+1,)*2)
     repaired = np.zeros_like(result)
@@ -120,11 +175,12 @@ def repair_silhouette(foreground, excluded):
     return result, dict(cable_crossing_px=int((result & foreground & excluded).sum()),
                         body_repair_px=int((result & ~foreground).sum()),
                         closing_radius_px=radius, support_band_px=band,
-                        max_cavity_area_px=max_area, min_boundary_support=.72)
+                        max_cavity_area_px=max_area, min_boundary_support=.72,
+                        body_repair_enabled=True)
 
 
-def compose_mask(robot, additions=(), exclusions=()):
-    """Add nearby parts, remove exposed cables, and repair body cavities.
+def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=False):
+    """Add nearby parts and remove exposed cables while preserving existing gaps.
 
     Reject disconnected additions (e.g. objects on a monitor) and gross changes.
     These are review safeguards, not guarantees of segmentation correctness.
@@ -133,18 +189,39 @@ def compose_mask(robot, additions=(), exclusions=()):
     if robot.ndim != 2:
         raise ValueError('Expected a 2D robot mask')
     result = robot.copy()
+    recovered = 0
+    if recover_hands and len(hands):
+        # A missing hand has little overlap with the robot prompt, but still
+        # joins its wrist. Reject miniature screen detections and distant hands.
+        radius = max(1, round(12 * robot.shape[1] / 1280))
+        near_robot = cv2.dilate(robot.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)) > 0
+        candidates = []
+        for hand in hands:
+            hand = np.asarray(hand, bool)
+            if hand.shape != robot.shape:
+                raise ValueError('Hand and robot dimensions must match')
+            candidates.append(hand)
+        largest = max(hand.sum() for hand in candidates)
+        for hand in candidates:
+            area = hand.sum()
+            if area and area >= .1*largest and np.count_nonzero(hand & near_robot) >= max(1, .005*area):
+                recovered += int((hand & ~result).any())
+                result |= hand
+    hand_added = int((result & ~robot).sum())
+    protected, hand_count = hand_envelopes(result, hands)
     added, removed = np.zeros_like(robot), np.zeros_like(robot)
     stats = dict(accepted_additions=0, skipped_additions=0, accepted_exclusions=0,
                  skipped_exclusions=0)
     radius = max(1, round(12 * robot.shape[1] / 1280))
     near = cv2.dilate(robot.astype(np.uint8),
                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)) > 0
-    area = robot.sum()
+    area = result.sum()
     for obj in additions:
         obj = np.asarray(obj, bool)
         if obj.shape != robot.shape:
             raise ValueError('Object and robot dimensions must match')
-        novel = obj & ~robot
+        novel = obj & ~robot & ~protected
         if not area or not (obj & near).any() or (added | novel).sum() > .25 * area:
             stats['skipped_additions'] += 1
             continue
@@ -161,6 +238,8 @@ def compose_mask(robot, additions=(), exclusions=()):
             continue
         removed |= proposal
         stats['accepted_exclusions'] += 1
-    result, repair = repair_silhouette(result, removed)
-    return result, dict(stats, silhouette_repair=repair, added_px=int((result & ~robot).sum()),
+    result, repair = repair_silhouette(result, removed, protected if hand_count else None)
+    return result, dict(stats, protected_hands=hand_count, recovered_hands=recovered,
+                        hand_added_px=hand_added,
+                        protected_hand_px=int(protected.sum()), silhouette_repair=repair, added_px=int((result & ~robot).sum()),
                         removed_px=int((robot & ~result).sum()))

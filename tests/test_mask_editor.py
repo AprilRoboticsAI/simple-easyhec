@@ -47,6 +47,54 @@ class CleanupTests(unittest.TestCase):
         self.assertGreater(result.sum(), 1500)
         np.testing.assert_array_equal(editor.raw, mask > 0)
 
+    def test_review_preserves_small_and_large_enclosed_hand_gaps(self):
+        mask = np.zeros((240, 1280), np.uint8)
+        mask[40:200, 60:200] = 1
+        mask[70:75, 90:95] = 0
+        mask[110:135, 120:145] = 0
+        support = np.zeros_like(mask)
+        support[190:220, 160:180] = 1
+        for cleanup in (None, dict(prompts={}, additions=[support], exclusions=[])):
+            with self.subTest(cleanup=cleanup is not None):
+                editor = MaskEditor(mask, cleanup=cleanup)
+                result = editor.result()
+                self.assertFalse(result[72, 92])
+                self.assertFalse(result[120, 130])
+                self.assertFalse((result & ~(mask.astype(bool) | support.astype(bool))).any())
+                if cleanup is not None:
+                    self.assertTrue(result[210, 170])
+                self.assertFalse(editor.metadata()['cleanup']['holes'])
+
+    def test_final_islands_after_subtraction_preserve_seeds_and_brushes(self):
+        mask = np.zeros((240, 1280), np.uint8)
+        mask[30:150, 40:160] = 1
+        mask[80:88, 155:210] = 1
+        cable = np.zeros_like(mask)
+        cable[75:95, 160:200] = 1
+        editor = MaskEditor(mask, cleanup=dict(prompts={}, additions=[], exclusions=[cable]))
+        self.assertFalse(editor.result()[83, 205])
+        self.assertTrue(editor.result()[80, 100])
+        self.assertGreater(editor.metadata()['image_cleanup']['final_islands_removed_px'], 0)
+        editor.add_point(205, 83, 1)
+        self.assertTrue(editor.result()[83, 205])
+        editor.begin_stroke(250, 100, 1, 2)
+        self.assertTrue(editor.result()[100, 250])
+
+    def test_final_pass_removes_185_pixel_fragment_but_keeps_larger_parts(self):
+        mask = np.zeros((240, 1280), np.uint8)
+        mask[30:150, 40:160] = 1
+        fragment = np.zeros_like(mask, dtype=bool)
+        fragment[180:185, 300:337] = True  # 185 pixels, matching the cable remnant.
+        larger = np.zeros_like(fragment)
+        larger[180:200, 400:420] = True
+        from unittest.mock import patch
+        with patch('easyhec.segmentation.image_cleanup.compose_mask',
+                   return_value=(mask.astype(bool) | fragment | larger, {})):
+            editor = MaskEditor(mask, cleanup=dict(prompts={}, additions=[], exclusions=[]))
+            result = editor.result()
+            self.assertFalse((result & fragment).any())
+            self.assertTrue(result[larger].all())
+
     def test_brush_overrides_cleanup_and_survives_new_sam_prediction(self):
         mask = np.ones((80, 80), np.uint8)
         editor = MaskEditor(mask)
@@ -127,7 +175,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(adapter.points, [(100, 100, 1)])
         self.assertEqual(len(adapter.review_metadata['strokes']), 2)
         self.assertEqual(adapter.review_metadata['strokes'][0]['radius'], 24)
-        self.assertTrue(adapter.review_metadata['cleanup']['holes'])
+        self.assertFalse(adapter.review_metadata['cleanup']['holes'])
 
     def test_point_mode_requires_generation_before_accepting(self):
         mask = np.zeros((120, 160), np.uint8); mask[30:90, 30:90] = 1

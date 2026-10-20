@@ -158,30 +158,51 @@ inscribed radius at 1280-pixel width), and below 3% of the robot-mask area.
 Only predicted pixels within that neighborhood are removed. The shape heuristic
 only proposes clicks; SAM supplies the removed pixels.
 Automatic points do not change the user's clicks or selected robot instance.
+Cable detections near the selected robot also seed up to six padded crops.
+SAM re-detects cables at higher effective resolution in these crops to recover
+thin parallel loops. Predictions thicker than 14 pixels (scaled from 1280-wide
+images) or larger than 3% of the robot mask are rejected.
 Cable cuts are restored only
-within the pre-subtraction mask using local closing. Small body cavities require
-72% foreground support in a surrounding band; new pixels near removed cables
-are excluded. Repair size limits scale with image resolution and are recorded
-in metadata. This is conservative mask repair, not a guarantee that every
-interior/background ambiguity is resolved. All detected instances are
+within the pre-subtraction mask using local closing, at least four scaled pixels
+inside its edge so exposed cable fragments are not reconnected at wrists.
+SAM detects `robot hand` instances. For datasets with recorded hands, masks at
+least 10% as large as the largest hand detection can be merged when at least
+0.5% of their pixels touch a 12-pixel neighborhood of the selected robot (radius
+scaled from 1280 image width). This recovers hands missing from the robot prompt
+without requiring them to already overlap it. Distant and miniature screen
+detections are rejected. Recovery is disabled for datasets without hand feedback.
+A padded convex
+envelope around each hand protects its open and enclosed finger gaps from both
+support additions and cavity repair. Outside these envelopes, body cavities
+require 72% surrounding foreground support; candidates near removed cables are
+excluded and repair sizes scale with image resolution. Without a matching hand
+detection, cavity repair is skipped. Detection counts and repair areas are saved
+in metadata. This protects detected hands; missed hands remain a limitation.
+All detected instances are
 considered; remote additions and excessive changes are skipped. Manual brush
 edits apply after composition. The robot instance itself is still selected by
-the existing text/confidence/positive-click rules.
+text detections: automatic selection excludes candidates smaller than 25% of
+the largest mask, then uses confidence among the remaining instances. Positive
+clicks override the size filter so a smaller instance can still be selected.
 
 Run `experiments/evaluate_image_cleanup.py --dataset DIR --output NEW_DIR`
 in the SAM environment for before/after images, change overlays, a gallery and
 per-frame diagnostics. It writes only the new output directory and never
 changes dataset masks.
 
-Cleanup is **always applied**: remove selected islands smaller than 32 pixels,
-fill enclosed holes up to 128 pixels, and open gently with a 5×5 ellipse.
-There are no filter toggles. Border-connected background and larger holes stay
+Cleanup is **always applied**: remove selected islands smaller than 32 pixels
+and open gently with a 5×5 ellipse. Automatic hole filling is disabled.
+There are no filter toggles. Border-connected background and enclosed holes stay
 open; island removal retains larger disconnected parts and positively seeded islands.
 Parameters are in native image pixels, chosen for the 1280×800 OAK captures.
-Cleanup runs in order: hole filling, opening, island removal. Brush strokes apply
+Cleanup runs in order: opening, island removal, optional image composition.
+After image composition, a final pass removes detached islands smaller than
+256 pixels at 1280 image width (scaled by image area), preserving positive-click
+components. This catches fragments newly separated by cable subtraction.
+Brush strokes apply
 last and survive SAM regeneration. A restore stroke can
 therefore deliberately keep a small component, and an erase stroke stays erased
-despite automatic hole filling. `v` is read-only; pressing `t` while comparing
+after regeneration. `v` is read-only; pressing `t` while comparing
 first returns to the edited preview, requiring another `t` to accept. Existing
 masks remain untouched until acceptance with `--overwrite`. These controls do
 not change the SAM 2 upstream UI.
