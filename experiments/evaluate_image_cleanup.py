@@ -26,7 +26,7 @@ def main():
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     doc = json.loads((args.dataset/'dataset.json').read_text())
-    prompts = dict(include=['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else [], exclude=['cable'])
+    prompts = dict(include=['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else [], exclude=['cable'], protect=['robot hand'], recover_hands=bool(doc.get('hands')))
     segmenter = build_segmenter(text='robot')
     rows, cards = [], []
     try:
@@ -36,7 +36,7 @@ def main():
             if bgr is None:
                 raise ValueError(f'Cannot read {sample["image"]}')
             raw = segmenter(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), [])
-            cleanup = dict(prompts=prompts, additions=segmenter.detect_objects(prompts['include']),
+            cleanup = dict(prompts=prompts, hands=segmenter.detect_objects(prompts['protect']), additions=segmenter.detect_objects(prompts['include']),
                            exclusions=segmenter.detect_exclusions(prompts['exclude'], raw))
             baseline = MaskEditor(raw).result()
             editor = MaskEditor(raw, cleanup=cleanup)

@@ -17,6 +17,25 @@ from easyhec.segmentation.mask_editor import MaskEditor
 @unittest.skipUnless(importlib.util.find_spec('torch') and importlib.util.find_spec('easyhec'),
                      'requires the EasyHeC segmentation environment')
 class Sam31Tests(unittest.TestCase):
+    def test_small_monitor_robot_cannot_win_by_confidence(self):
+        image = np.zeros((100, 160, 3), np.uint8)
+        masks = np.zeros((3, 100, 160), bool)
+        masks[0, 10:90, 10:70] = True
+        masks[1, 10:20, 120:135] = True  # Small monitor depiction, highest score.
+        masks[2, 20:80, 70:110] = True  # Comparable size: confidence still wins.
+        model = Mock()
+        model.init_state.return_value = {}
+        model.add_prompt.return_value = (0, dict(out_obj_ids=[1, 2, 3],
+            out_probs=[.8, .99, .9], out_binary_masks=masks))
+        adapter = segmentation.Sam31Segmenter(model, text='robot')
+        try:
+            np.testing.assert_array_equal(adapter(image, []), masks[2])
+            with patch.object(adapter, '_use_detected_mask_for_refinement'):
+                np.testing.assert_array_equal(adapter(image, [[125, 15, 1]]), masks[1])
+                self.assertEqual(model.add_prompt.call_args.kwargs['obj_id'], 2)
+        finally:
+            adapter.close()
+
     def test_click_coordinates_labels_and_reset_between_annotations(self):
         image = np.zeros((40, 80, 3), np.uint8)
         image[3, 4] = [10, 20, 30]

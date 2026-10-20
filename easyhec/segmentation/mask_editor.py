@@ -98,7 +98,7 @@ class MaskEditor:
 
     def result(self):
         if self._cache is None:
-            result = fill_small_holes(self.raw)
+            result = self.raw.copy()
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             result = cv2.morphologyEx(result.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
             seeds = [(x, y) for x, y, label in self.points if label > 0]
@@ -107,7 +107,19 @@ class MaskEditor:
                 from easyhec.segmentation.image_cleanup import compose_mask
 
                 composed, self.auto_metadata = compose_mask(
-                    result, self.cleanup['additions'], self.cleanup['exclusions'])
+                    result, self.cleanup['additions'], self.cleanup['exclusions'],
+                    hands=self.cleanup.get('hands', ()),
+                    recover_hands=self.cleanup['prompts'].get('recover_hands', False))
+                # Cable subtraction can detach fragments after the first island
+                # pass. Filter those before recording changes or applying brushes.
+                min_area = max(1, round(256 * self.raw.shape[1]**2 / 1280**2))
+                filtered = remove_small_islands(composed, min_area=min_area,
+                                                foreground_points=seeds)
+                self.auto_metadata['final_islands_removed_px'] = int((composed & ~filtered).sum())
+                self.auto_metadata['final_min_island_area_px'] = min_area
+                composed = filtered
+                self.auto_metadata['added_px'] = int((composed & ~result).sum())
+                self.auto_metadata['removed_px'] = int((result & ~composed).sum())
                 self.auto_added = composed & ~result
                 self.auto_removed = result & ~composed
                 if self.auto_enabled:
@@ -121,9 +133,9 @@ class MaskEditor:
         self.result()
         automatic = None if self.cleanup is None else dict(
             self.auto_metadata, enabled=self.auto_enabled, prompts=self.cleanup['prompts'])
-        return dict(version=2, image_cleanup=automatic, cleanup=dict(islands=True, holes=True, opening=True, min_island_area_px=32,
-                    max_hole_area_px=128, opening_radius_px=2),
-                    cleanup_order=['holes', 'opening', 'islands'],
+        return dict(version=2, image_cleanup=automatic, cleanup=dict(islands=True, holes=False, opening=True, min_island_area_px=32,
+                    max_hole_area_px=0, opening_radius_px=2),
+                    cleanup_order=['opening', 'islands'],
                     brush_applied_after_cleanup=True, strokes=deepcopy(self.strokes))
 
 
@@ -134,7 +146,9 @@ def review_mask(image, segmenter):
     prompts = getattr(segmenter, 'cleanup_prompts', None)
     cleanup = None
     if isinstance(prompts, dict):
+        prompts = dict(prompts, protect=['robot hand'])
         cleanup = dict(prompts=prompts,
+                       hands=segmenter.detect_objects(prompts['protect']),
                        additions=segmenter.detect_objects(prompts['include']),
                        exclusions=segmenter.detect_exclusions(prompts['exclude'], initial))
     editor = MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text),

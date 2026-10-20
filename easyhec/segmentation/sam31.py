@@ -81,9 +81,14 @@ class Sam31Segmenter:
             scores = np.asarray(output['out_probs'])
             positive = points[points[:, 2] > 0, :2].astype(int)
             hits = masks[:, positive[:, 1], positive[:, 0]].sum(axis=1)
-            # A single mask is calibrated. Positive clicks select among detected
-            # instances; confidence breaks ties (including the text-only case).
-            selected = max(range(len(ids)), key=lambda i: (hits[i], scores[i]))
+            # Ignore small depictions (e.g. a robot on a monitor) when choosing
+            # automatically. Relative area also works for cropped images.
+            areas = masks.reshape(len(ids), -1).sum(axis=1)
+            eligible = np.flatnonzero(areas >= .25 * areas.max())
+            # An explicit foreground click can still select a smaller instance.
+            if hits.max() > 0:
+                eligible = np.flatnonzero(hits == hits.max())
+            selected = max(eligible, key=lambda i: (hits[i], scores[i]))
             self.object_id = int(ids[selected])
             print(f'Text {self.text!r}: {len(ids)} candidate(s), refining object {self.object_id}')
             if not len(points):
@@ -119,11 +124,28 @@ class Sam31Segmenter:
 
     def detect_exclusions(self, texts, robot):
         """Supplement cable text detections with automatic local point prompts."""
-        from .image_cleanup import cable_loop_candidates, local_cable_prediction
+        from .image_cleanup import cable_loop_candidates, local_cable_prediction, cable_crop_boxes
 
         objects = self.detect_objects(texts)
         if not any('cable' in text.lower() or 'wire' in text.lower() for text in texts):
             return objects
+        # A full-frame prediction can miss a parallel cable only a few pixels
+        # wide. Re-detect at higher effective resolution in nearby cable crops.
+        cropped = Sam31Segmenter(self.model, text=texts[0])
+        try:
+            for x0, y0, x1, y1 in cable_crop_boxes(robot, objects):
+                cropped(self.image[y0:y1, x0:x1], [])
+                for mask in cropped.detect_objects(texts):
+                    mask = np.asarray(mask, bool)
+                    thickness = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5).max()
+                    if mask.sum() > .03*robot.sum() or thickness > max(2, 14*robot.shape[1]/1280):
+                        continue
+                    full = np.zeros_like(robot, dtype=bool)
+                    full[y0:y1, x0:x1] = mask
+                    if (full & robot).any():
+                        objects.append(full)
+        finally:
+            cropped.close()
         # Share the loaded frame, but keep automatic points out of user metadata.
         # Every call resets the inference state, as does subsequent user refinement.
         local = Sam31Segmenter(self.model)
@@ -258,6 +280,7 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
     segmenter.cleanup_prompts = None
     if image_cleanup:
         segmenter.cleanup_prompts = dict(
+            recover_hands=bool(doc.get('hands')),
             include=(include_text if include_text is not None else
                      ['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else []),
             exclude=exclude_text if exclude_text is not None else ['cable'])
