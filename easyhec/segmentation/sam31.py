@@ -74,6 +74,13 @@ class Sam31Segmenter:
             _, output = self.model.add_prompt(
                 inference_state=self.state, frame_idx=0, text_str=self.text)
             masks, ids = self._masks(output, height, width)
+            if not len(ids) and self.text == 'robot':
+                # The whole-rig concept can fail even when the arms are clear.
+                self.model.reset_state(self.state)
+                _, output = self.model.add_prompt(
+                    inference_state=self.state, frame_idx=0, text_str='robot arm')
+                masks, ids = self._masks(output, height, width)
+                print('Robot prompt empty; retrying with robot arm')
             if not len(ids):
                 self.object_id = None
                 print(f'No object found for {self.text!r}; try a different text prompt.')
@@ -270,7 +277,9 @@ def review_text_mask(image, segmenter):
 def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=False,
             include_text=None, exclude_text=None):
     doc = json.loads((dataset / 'dataset.json').read_text())
-    samples = [s for s in doc['samples'] if overwrite or not (dataset / s['mask']).exists()]
+    samples = [s for s in doc['samples'] if overwrite or (
+        not (dataset / s['mask']).exists()
+        and not (dataset / s['mask']).with_suffix('.rejected.json').exists())]
     if not samples:
         print('All samples already have masks; use --overwrite to review replacements')
         return
@@ -281,6 +290,8 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
     if image_cleanup:
         segmenter.cleanup_prompts = dict(
             recover_hands=bool(doc.get('hands')),
+            protect=['robot hand', 'black glove'],
+            background=['wall', 'table'],
             include=(include_text if include_text is not None else
                      ['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else []),
             exclude=exclude_text if exclude_text is not None else ['cable'])
@@ -296,6 +307,13 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
             mask = review_text_mask(rgb, segmenter)
             path = dataset / sample['mask']
             path.parent.mkdir(parents=True, exist_ok=True)
+            rejection = path.with_suffix('.rejected.json')
+            if mask is None:
+                temporary = rejection.with_suffix('.tmp')
+                temporary.write_text(json.dumps(dict(image=sample['image'], reason='operator_rejected'), indent=2) + '\n')
+                temporary.replace(rejection)
+                print(f'Rejected {sample["image"]}; excluded from calibration')
+                continue
             # Save each reviewed frame immediately; an interrupted session can resume.
             temporary = path.with_name(path.stem + '.tmp.png')
             if not cv2.imwrite(str(temporary), (mask > 0).astype(np.uint8) * 255):
@@ -309,6 +327,7 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
                 image=sample['image'], clicks_xy_label=segmenter.points,
                 mask_review=segmenter.review_metadata)
             path.with_suffix('.json').write_text(json.dumps(provenance, indent=2) + '\n')
+            rejection.unlink(missing_ok=True)
             print(f'Saved {path}')
     finally:
         segmenter.close()

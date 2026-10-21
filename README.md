@@ -126,10 +126,22 @@ image. SAM 3.1 detects objects from text first, then refines the selected object
 with positive/negative points in the same inference state. If text finds several
 instances, the highest-confidence instance is initially shown; positive clicks
 select the instance covering the most positive clicks, with confidence breaking
-ties. No detection produces an empty preview, requiring a different prompt.
+ties. An empty `robot` detection automatically retries `robot arm`; if both fail,
+the preview remains empty.
 Text, selected object ID, clicks, cleanup settings and brush strokes are saved
 with the mask. Review whether a broad term like "robot" includes gloves or cables
 that are absent from the calibration geometry.
+
+With `--image-cleanup`, hand-enabled datasets also detect black gloves to recover
+hands missed by the robot-hand prompt. Nearby detections may span a short missing
+wrist adapter, but the gap itself is not filled. Wall and table detections remove
+background mistakenly included inside the robot silhouette. The review path no
+longer fills body cavities, which could close real arm/stand gaps.
+
+For offline validation, `experiments/evaluate_image_cleanup.py --dataset DIR
+--output NEW_DIR` generates fresh predictions from images without reading or
+writing the dataset's saved masks. Add `--reference PREVIOUS_EVALUATION_DIR` to
+compare against an earlier automatic run. Never use edited masks as that reference.
 
 Both text and point-only SAM 3.1 annotation use the same mask editor:
 

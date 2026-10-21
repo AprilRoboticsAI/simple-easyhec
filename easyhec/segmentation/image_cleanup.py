@@ -179,7 +179,8 @@ def repair_silhouette(foreground, excluded, protected=None):
                         body_repair_enabled=True)
 
 
-def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=False):
+def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=False,
+                 backgrounds=(), repair_body=True):
     """Add nearby parts and remove exposed cables while preserving existing gaps.
 
     Reject disconnected additions (e.g. objects on a monitor) and gross changes.
@@ -193,7 +194,9 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
     if recover_hands and len(hands):
         # A missing hand has little overlap with the robot prompt, but still
         # joins its wrist. Reject miniature screen detections and distant hands.
-        radius = max(1, round(12 * robot.shape[1] / 1280))
+        # Wrist adapters can be omitted by both semantic masks. Allow a short
+        # wrist-sized gap, without drawing a bridge across that unobserved area.
+        radius = max(1, round(48 * robot.shape[1] / 1280))
         near_robot = cv2.dilate(robot.astype(np.uint8),
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)) > 0
         candidates = []
@@ -205,7 +208,9 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
         largest = max(hand.sum() for hand in candidates)
         for hand in candidates:
             area = hand.sum()
-            if area and area >= .1*largest and np.count_nonzero(hand & near_robot) >= max(1, .005*area):
+            # A close-up palm can dwarf the narrow wrist contact. Requiring
+            # 0.5% of its area discarded valid large hands at the image edge.
+            if area and area >= .1*largest and np.count_nonzero(hand & near_robot) >= max(4, .001*area):
                 recovered += int((hand & ~result).any())
                 result |= hand
     hand_added = int((result & ~robot).sum())
@@ -238,8 +243,22 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
             continue
         removed |= proposal
         stats['accepted_exclusions'] += 1
-    result, repair = repair_silhouette(result, removed, protected if hand_count else None)
+    result, repair = repair_silhouette(result, removed, protected if hand_count and repair_body else None)
+    # Semantic scene evidence can open a gap which the broad robot prompt
+    # incorrectly enclosed. Apply last: morphological repair must not refill it.
+    background_removed = np.zeros_like(robot)
+    for obj in backgrounds:
+        obj = np.asarray(obj, bool)
+        if obj.shape != robot.shape:
+            raise ValueError('Background and robot dimensions must match')
+        # Keep uncertain boundary pixels; remove only the detection's interior.
+        interior = cv2.erode(obj.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        proposal = interior & result
+        if (background_removed | proposal).sum() <= .25 * max(1, result.sum()):
+            background_removed |= proposal
+    result &= ~background_removed
     return result, dict(stats, protected_hands=hand_count, recovered_hands=recovered,
+                        background_removed_px=int(background_removed.sum()),
                         hand_added_px=hand_added,
                         protected_hand_px=int(protected.sum()), silhouette_repair=repair, added_px=int((result & ~robot).sum()),
                         removed_px=int((robot & ~result).sum()))
