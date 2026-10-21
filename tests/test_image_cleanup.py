@@ -12,6 +12,20 @@ import test_mask_editor
 
 
 class CompositionTests(unittest.TestCase):
+    def test_scene_background_opens_gap_without_removing_surrounding_robot(self):
+        robot = np.zeros((120,160), bool)
+        robot[10:110,20:140] = True
+        wall = np.zeros_like(robot)
+        wall[40:75,65:90] = True
+        result, metadata = compose_mask(robot, backgrounds=[wall], repair_body=False)
+        self.assertFalse(result[55,75])
+        self.assertTrue(result[55,40])
+        self.assertGreater(metadata['background_removed_px'], 0)
+        # A background detection covering the whole robot is not trustworthy.
+        result, metadata = compose_mask(robot, backgrounds=[np.ones_like(robot)])
+        np.testing.assert_array_equal(result, robot)
+        self.assertEqual(metadata['background_removed_px'], 0)
+
     def setUp(self):
         self.robot = np.zeros((120,160),bool)
         self.robot[10:40,30:130] = True
@@ -71,6 +85,12 @@ class CompositionTests(unittest.TestCase):
         self.assertFalse(result[180, 850])
         self.assertGreater(stats['hand_added_px'], 0)
         result, _ = compose_mask(robot, hands=[hand], recover_hands=False)
+        self.assertFalse(result[180, 150])
+        # Neither prompt sees a short wrist adapter; retain the hand but do
+        # not fabricate foreground across that gap.
+        separated = np.roll(hand, 40, axis=0)
+        result, _ = compose_mask(robot, hands=[separated], recover_hands=True)
+        self.assertTrue(result[230, 150])
         self.assertFalse(result[180, 150])
 
     def test_repairs_body_hole_but_protects_same_size_curled_hand_gap(self):
@@ -247,13 +267,13 @@ class ReviewTests(unittest.TestCase):
         fixture.setUp()
         adapter = Mock(text='robot', object_id=1, return_value=fixture.raw.astype(np.uint8))
         adapter.cleanup_prompts = fixture.cleanup['prompts']
-        adapter.detect_objects.side_effect = [[], [fixture.post]]
+        adapter.detect_objects.side_effect = [[], [], [fixture.post]]
         adapter.detect_exclusions.return_value = [fixture.cable]
         result = self.run_review(adapter,[([],ord('d')),([],ord('a')),([],ord('u')),([],ord('t'))])
         self.assertTrue(result[80,80])
         self.assertFalse(result[52,60])
-        self.assertEqual(adapter.detect_objects.call_count,2)
-        self.assertEqual(adapter.detect_objects.call_args_list[0].args, (['robot hand'],))
+        self.assertEqual(adapter.detect_objects.call_count,3)
+        self.assertEqual(adapter.detect_objects.call_args_list[0].args, (['robot hand', 'black glove'],))
         self.assertEqual(adapter.detect_exclusions.call_count,1)
         self.assertTrue(adapter.review_metadata['image_cleanup']['enabled'])
 

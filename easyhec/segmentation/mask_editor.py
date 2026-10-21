@@ -109,7 +109,9 @@ class MaskEditor:
                 composed, self.auto_metadata = compose_mask(
                     result, self.cleanup['additions'], self.cleanup['exclusions'],
                     hands=self.cleanup.get('hands', ()),
-                    recover_hands=self.cleanup['prompts'].get('recover_hands', False))
+                    recover_hands=self.cleanup['prompts'].get('recover_hands', False),
+                    backgrounds=self.cleanup.get('backgrounds', ()),
+                    repair_body=self.cleanup['prompts'].get('repair_body', False))
                 # Cable subtraction can detach fragments after the first island
                 # pass. Filter those before recording changes or applying brushes.
                 min_area = max(1, round(256 * self.raw.shape[1]**2 / 1280**2))
@@ -146,9 +148,12 @@ def review_mask(image, segmenter):
     prompts = getattr(segmenter, 'cleanup_prompts', None)
     cleanup = None
     if isinstance(prompts, dict):
-        prompts = dict(prompts, protect=['robot hand'])
+        prompts = dict(prompts)
+        prompts.setdefault('protect', ['robot hand', 'black glove'])
+        prompts.setdefault('background', ['wall', 'table'])
         cleanup = dict(prompts=prompts,
                        hands=segmenter.detect_objects(prompts['protect']),
+                       backgrounds=segmenter.detect_objects(prompts['background']),
                        additions=segmenter.detect_objects(prompts['include']),
                        exclusions=segmenter.detect_exclusions(prompts['exclude'], initial))
     editor = MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text),

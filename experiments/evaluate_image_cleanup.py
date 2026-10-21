@@ -23,10 +23,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--reference', type=Path, help='Previous fresh automatic evaluation output (never edited source masks)')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     doc = json.loads((args.dataset/'dataset.json').read_text())
-    prompts = dict(include=['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else [], exclude=['cable'], protect=['robot hand'], recover_hands=bool(doc.get('hands')))
+    prompts = dict(include=['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else [], exclude=['cable'], protect=['robot hand', 'black glove'], background=['wall', 'table'], recover_hands=bool(doc.get('hands')))
     segmenter = build_segmenter(text='robot')
     rows, cards = [], []
     try:
@@ -37,8 +38,14 @@ def main():
                 raise ValueError(f'Cannot read {sample["image"]}')
             raw = segmenter(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), [])
             cleanup = dict(prompts=prompts, hands=segmenter.detect_objects(prompts['protect']), additions=segmenter.detect_objects(prompts['include']),
+                           backgrounds=segmenter.detect_objects(prompts['background']),
                            exclusions=segmenter.detect_exclusions(prompts['exclude'], raw))
             baseline = MaskEditor(raw).result()
+            if args.reference:
+                previous = cv2.imread(str(args.reference/f'{i:03d}-automatic.png'), cv2.IMREAD_GRAYSCALE)
+                if previous is None or previous.shape != raw.shape:
+                    raise ValueError('Missing or mismatched automatic reference mask')
+                baseline = previous > 0
             editor = MaskEditor(raw, cleanup=cleanup)
             result = editor.result()
             added, removed = result & ~baseline, baseline & ~result
@@ -48,8 +55,8 @@ def main():
             for name, mask in [('baseline', baseline), ('automatic', result), ('added', added), ('removed', removed)]:
                 if not cv2.imwrite(str(args.output/f'{i:03d}-{name}.png'),mask.astype(np.uint8)*255):
                     raise OSError('Could not write comparison mask')
-            before = panel(bgr, baseline, 'Before: robot prompt + existing cleanup')
-            after = panel(bgr, result, 'After: support added, cables subtracted (image only)')
+            before = panel(bgr, baseline, 'Before: previous automatic result' if args.reference else 'Raw robot detection')
+            after = panel(bgr, result, 'After: automatic parts and background cleanup')
             changes = panel(bgr, added, 'Changes: cyan added, magenta removed', (255,220,40))
             changes[removed] = .4*changes[removed]+.6*np.array([230,40,230])
             original = panel(bgr, np.zeros_like(result), 'Original image')

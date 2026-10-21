@@ -74,6 +74,13 @@ class Sam31Segmenter:
             _, output = self.model.add_prompt(
                 inference_state=self.state, frame_idx=0, text_str=self.text)
             masks, ids = self._masks(output, height, width)
+            if not len(ids) and self.text == 'robot':
+                # The whole-rig concept can fail even when the arms are clear.
+                self.model.reset_state(self.state)
+                _, output = self.model.add_prompt(
+                    inference_state=self.state, frame_idx=0, text_str='robot arm')
+                masks, ids = self._masks(output, height, width)
+                print('Robot prompt empty; retrying with robot arm')
             if not len(ids):
                 self.object_id = None
                 print(f'No object found for {self.text!r}; try a different text prompt.')
@@ -283,6 +290,8 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
     if image_cleanup:
         segmenter.cleanup_prompts = dict(
             recover_hands=bool(doc.get('hands')),
+            protect=['robot hand', 'black glove'],
+            background=['wall', 'table'],
             include=(include_text if include_text is not None else
                      ['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else []),
             exclude=exclude_text if exclude_text is not None else ['cable'])

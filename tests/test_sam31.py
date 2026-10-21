@@ -17,6 +17,22 @@ from easyhec.segmentation.mask_editor import MaskEditor
 @unittest.skipUnless(importlib.util.find_spec('torch') and importlib.util.find_spec('easyhec'),
                      'requires the EasyHeC segmentation environment')
 class Sam31Tests(unittest.TestCase):
+    def test_empty_robot_prompt_falls_back_to_arm_detection(self):
+        model = Mock()
+        model.init_state.return_value = {}
+        masks = np.zeros((1,40,80), bool)
+        masks[0,10:30,20:60] = True
+        model.add_prompt.side_effect = [
+            (0, dict(out_obj_ids=[], out_binary_masks=np.zeros((0,40,80), bool))),
+            (0, dict(out_obj_ids=[7], out_probs=[.9], out_binary_masks=masks))]
+        adapter = segmentation.Sam31Segmenter(model, text='robot')
+        try:
+            np.testing.assert_array_equal(adapter(np.zeros((40,80,3), np.uint8), []), masks[0])
+            self.assertEqual(model.add_prompt.call_args.kwargs['text_str'], 'robot arm')
+            self.assertEqual(adapter.object_id, 7)
+        finally:
+            adapter.close()
+
     def test_small_monitor_robot_cannot_win_by_confidence(self):
         image = np.zeros((100, 160, 3), np.uint8)
         masks = np.zeros((3, 100, 160), bool)
@@ -250,7 +266,8 @@ class Sam31Tests(unittest.TestCase):
             mask = adapter(np.zeros((40, 80, 3), np.uint8), [[10, 10, 1]])
             self.assertFalse(mask.any())
             self.assertIsNone(adapter.object_id)
-            model.add_prompt.assert_called_once()
+            self.assertEqual(model.add_prompt.call_count, 2)
+            self.assertEqual(model.add_prompt.call_args.kwargs['text_str'], 'robot arm')
         finally:
             adapter.close()
 
