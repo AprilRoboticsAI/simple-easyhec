@@ -180,7 +180,7 @@ def repair_silhouette(foreground, excluded, protected=None):
 
 
 def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=False,
-                 backgrounds=(), repair_body=True):
+                 backgrounds=(), repair_body=True, strict_exclusions=()):
     """Add nearby parts and remove exposed cables while preserving existing gaps.
 
     Reject disconnected additions (e.g. objects on a monitor) and gross changes.
@@ -257,7 +257,17 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
         if (background_removed | proposal).sum() <= .25 * max(1, result.sum()):
             background_removed |= proposal
     result &= ~background_removed
+    # Geometry deliberately omitted from fitting must never be restored as a
+    # cable crossing. Apply exact semantic masks after all silhouette repair.
+    strict_removed = np.zeros_like(robot)
+    for obj in strict_exclusions:
+        obj = np.asarray(obj, bool)
+        if obj.shape != robot.shape:
+            raise ValueError('Strict exclusion and robot dimensions must match')
+        strict_removed |= obj & result
+    result &= ~strict_removed
     return result, dict(stats, protected_hands=hand_count, recovered_hands=recovered,
+                        strict_removed_px=int(strict_removed.sum()),
                         background_removed_px=int(background_removed.sum()),
                         hand_added_px=hand_added,
                         protected_hand_px=int(protected.sum()), silhouette_repair=repair, added_px=int((result & ~robot).sum()),
