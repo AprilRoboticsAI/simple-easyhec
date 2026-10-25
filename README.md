@@ -158,10 +158,11 @@ Both text and point-only SAM 3.1 annotation use the same mask editor:
 | `r` | Reset prompts and brush edits; undo can restore them. |
 | Escape / close | Cancel this image without saving it. |
 
-Use `--image-cleanup` for image-only foreground composition. The default extra
-foreground prompts are `vertical metal support` and `black vertical post` for
-datasets containing `base`; the default exclusion is `cable`. Override with
-`--include-text` and `--exclude-text`. This requires text initialization and
+Masks always exclude the support post, lower mounting hardware, and cabinet
+rails. Review these exclusions manually when using clicks only. Use
+`--image-cleanup` for image-only foreground composition: no extra foreground is
+added by default, and support, rails and cables are removed. Customize additional
+prompts with `--include-text` and `--exclude-text`. Cleanup requires text initialization and
 uses no robot reprojection or camera estimate. For cable/wire exclusion prompts,
 thin enclosures around small background gaps supply up to six automatic SAM
 point prompts. Already detected loops are skipped. Point predictions must stay

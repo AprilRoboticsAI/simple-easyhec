@@ -12,6 +12,19 @@ import test_mask_editor
 
 
 class CompositionTests(unittest.TestCase):
+    def test_strict_post_and_rail_exclusions_survive_silhouette_repair(self):
+        robot = np.zeros((120, 160), bool)
+        robot[10:110, 20:140] = True
+        post = np.zeros_like(robot)
+        post[10:110, 75:85] = True
+        rail = np.zeros_like(robot)
+        rail[70:73, 20:140] = True
+        result, stats = compose_mask(robot, exclusions=[rail],
+                                     strict_exclusions=[post, rail], hands=[robot])
+        self.assertFalse(result[post | rail].any())
+        self.assertTrue(result[30, 40])
+        self.assertGreater(stats['strict_removed_px'], 0)
+
     def test_scene_background_opens_gap_without_removing_surrounding_robot(self):
         robot = np.zeros((120,160), bool)
         robot[10:110,20:140] = True

@@ -174,9 +174,16 @@ class Sam31Tests(unittest.TestCase):
                 np.testing.assert_array_equal(cv2.imread(str(root/'mask.png'), 0), new*255)
                 metadata = json.loads((root/'mask.json').read_text())
                 self.assertEqual(metadata['model'], 'sam3.1')
+                self.assertTrue(metadata['exclude_support'])
                 self.assertEqual(metadata['mask_review'], adapter.review_metadata)
                 self.assertEqual(metadata['clicks_xy_label'], [[15, 15, 1]])
                 adapter.close.assert_called_once()
+                adapter.object_id = 0
+                segmentation.segment(root, overwrite=True, text='robot', image_cleanup=True)
+                self.assertEqual(adapter.cleanup_prompts['include'], [])
+                self.assertIn('black vertical post', adapter.cleanup_prompts['strict_exclude'])
+                self.assertIn('horizontal metal rail inside cabinet', adapter.cleanup_prompts['strict_exclude'])
+                self.assertTrue(json.loads((root/'mask.json').read_text())['exclude_support'])
 
     def test_text_detection_then_refines_clicked_instance_in_same_state(self):
         image = np.zeros((40, 80, 3), np.uint8)

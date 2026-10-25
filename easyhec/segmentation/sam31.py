@@ -292,10 +292,14 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
             recover_hands=bool(doc.get('hands')),
             protect=['robot hand', 'black glove'],
             background=['wall', 'table'],
-            include=(include_text if include_text is not None else
-                     ['vertical metal support', 'black vertical post'] if 'base' in doc['parts'] else []),
-            exclude=exclude_text if exclude_text is not None else ['cable'])
+            # Generic metal supports also detect cabinet DIN rails; proximity
+            # to a moving hand cannot distinguish them from the robot's mast.
+            include=include_text if include_text is not None else [],
+            exclude=list(exclude_text if exclude_text is not None else ['cable']),
+            strict_exclude=['DIN rail', 'horizontal metal rail inside cabinet']
+                    + ['black vertical post', 'black metal pole', 'robot pedestal mounting base'])
     try:
+        print('Always exclude the support post, lower mounting hardware and cabinet rails; keep the upper body.')
         print('SAM 3.1: select only', ', '.join(doc['parts']),
               '(exclude objects outside the calibration geometry).')
         for index, sample in enumerate(samples):
@@ -320,6 +324,7 @@ def segment(dataset, checkpoint=None, overwrite=False, text=None, image_cleanup=
                 raise OSError(f'Could not save {path}')
             temporary.replace(path)
             provenance = dict(model='sam3.1', source_revision=SAM3_REVISION,
+                exclude_support=True,
                 checkpoint=str(checkpoint) if checkpoint else 'facebook/sam3.1/sam3.1_multiplex.pt',
                 checkpoint_revision=None if checkpoint else SAM31_CHECKPOINT_REVISION,
                 text_prompt=text, object_id=segmenter.object_id if text else 1,

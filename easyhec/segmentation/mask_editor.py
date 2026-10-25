@@ -111,6 +111,7 @@ class MaskEditor:
                     hands=self.cleanup.get('hands', ()),
                     recover_hands=self.cleanup['prompts'].get('recover_hands', False),
                     backgrounds=self.cleanup.get('backgrounds', ()),
+                    strict_exclusions=self.cleanup.get('strict_exclusions', ()),
                     repair_body=self.cleanup['prompts'].get('repair_body', False))
                 # Cable subtraction can detach fragments after the first island
                 # pass. Filter those before recording changes or applying brushes.
@@ -141,8 +142,8 @@ class MaskEditor:
                     brush_applied_after_cleanup=True, strokes=deepcopy(self.strokes))
 
 
-def review_mask(image, segmenter):
-    """Review either text- or point-initialized SAM masks in a single window."""
+def prepare_mask_editor(image, segmenter):
+    """Build the same automatic mask for interactive review and offline inspection."""
     text = segmenter.text
     initial = segmenter(image, []) if text else np.zeros(image.shape[:2], np.uint8)
     prompts = getattr(segmenter, 'cleanup_prompts', None)
@@ -155,9 +156,17 @@ def review_mask(image, segmenter):
                        hands=segmenter.detect_objects(prompts['protect']),
                        backgrounds=segmenter.detect_objects(prompts['background']),
                        additions=segmenter.detect_objects(prompts['include']),
+                       strict_exclusions=(segmenter.detect_objects(prompts['strict_exclude'])
+                                          if prompts.get('strict_exclude') else []),
                        exclusions=segmenter.detect_exclusions(prompts['exclude'], initial))
-    editor = MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text),
-                        cleanup=cleanup)
+    return MaskEditor(initial, segmenter.object_id if text else 1, pending=not bool(text),
+                      cleanup=cleanup)
+
+
+def review_mask(image, segmenter):
+    """Review either text- or point-initialized SAM masks in a single window."""
+    text = segmenter.text
+    editor = prepare_mask_editor(image, segmenter)
     show_changes = False
     window = 'SAM 3.1 mask review'
     brush_mode, original = False, False
