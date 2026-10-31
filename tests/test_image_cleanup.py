@@ -6,7 +6,7 @@ import numpy as np
 
 from easyhec.segmentation.image_cleanup import (compose_mask, repair_silhouette,
                                                cable_loop_candidates, local_cable_prediction,
-                                               cable_crop_boxes)
+                                               cable_crop_boxes, hand_crop_boxes, zoomed_hand_patch)
 from easyhec.segmentation.mask_editor import MaskEditor
 import test_mask_editor
 
@@ -215,6 +215,54 @@ class SilhouetteRepairTests(unittest.TestCase):
         self.assertTrue(0 <= y0 < 250 < 350 < y1 <= 800)
         self.assertEqual(cable_crop_boxes(robot, []), [])
 
+    def test_hand_crops_skip_arm_sized_and_connector_detections_and_merge_duplicates(self):
+        robot = np.zeros((800, 1280), bool)
+        robot[300:340, 100:600] = True
+        hand = np.zeros_like(robot)
+        hand[280:360, 600:700] = True
+        glove = hand.copy()  # a second prompt finding the same hand
+        connector = np.zeros_like(robot)
+        connector[340:346, 560:566] = True
+        arm = np.zeros_like(robot)
+        arm[280:360, 100:700] = True
+        remote = np.roll(hand, 400, axis=0)
+        boxes, used = hand_crop_boxes(robot, [hand, glove, connector, arm, remote])
+        self.assertEqual(len(boxes), 1)
+        x0, y0, x1, y1 = boxes[0]
+        self.assertTrue(x0 < 600 and 700 < x1 and y0 < 280 and 360 < y1)
+        self.assertTrue(x1 - x0 < 300)
+        self.assertTrue(used[300, 650])
+        self.assertFalse(used[343, 563] or used[320, 300])
+        boxes, used = hand_crop_boxes(robot, [])
+        self.assertEqual(boxes, [])
+        self.assertFalse(used.any())
+
+    def test_zoomed_patch_opens_finger_gap_but_keeps_cuff_and_rejects_connector(self):
+        # Arm ends at x=40; cuff 40:50; palm 50:80; fingers 80:120 with a gap
+        # the full-frame masks bridged.
+        robot = np.zeros((100, 140), bool)
+        robot[30:70, 0:120] = True
+        coarse = np.zeros_like(robot)
+        coarse[30:70, 40:120] = True
+        box = (20, 10, 140, 90)
+        crop = np.s_[10:90, 20:140]
+        hand = np.zeros_like(robot)
+        hand[30:70, 50:80] = True
+        hand[30:45, 80:120] = True
+        hand[55:70, 80:120] = True
+        connector = np.zeros_like(robot)
+        connector[0:5, 20:30] = True
+        region, mask = zoomed_hand_patch(robot, box, [hand[crop], connector[crop]], [], coarse)
+        result, stats = compose_mask(robot, hands=[coarse], hand_patches=[(region, mask)])
+        self.assertFalse(result[50, 100])  # finger gap opened
+        self.assertTrue(result[50, 45])    # cuff touches the arm: kept
+        self.assertTrue(result[50, 20])    # arm outside the hand untouched
+        self.assertTrue(result[35, 100])
+        self.assertFalse(result[2, 25])
+        self.assertEqual(stats['zoomed_hands'], 1)
+        self.assertGreater(stats['zoomed_hand_changed_px'], 0)
+        self.assertIsNone(zoomed_hand_patch(robot, box, [connector[crop]], [], coarse))
+
     def test_enclosed_and_open_finger_gaps_remain_background(self):
         mask = np.zeros((240, 1280), bool)
         mask[40:200, 60:200] = True
@@ -282,6 +330,7 @@ class ReviewTests(unittest.TestCase):
         adapter.cleanup_prompts = fixture.cleanup['prompts']
         adapter.detect_objects.side_effect = [[], [], [fixture.post]]
         adapter.detect_exclusions.return_value = [fixture.cable]
+        adapter.zoom_hands.return_value = []
         result = self.run_review(adapter,[([],ord('d')),([],ord('a')),([],ord('u')),([],ord('t'))])
         self.assertTrue(result[80,80])
         self.assertFalse(result[52,60])

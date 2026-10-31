@@ -112,6 +112,7 @@ class MaskEditor:
                     recover_hands=self.cleanup['prompts'].get('recover_hands', False),
                     backgrounds=self.cleanup.get('backgrounds', ()),
                     strict_exclusions=self.cleanup.get('strict_exclusions', ()),
+                    hand_patches=self.cleanup.get('hand_patches', ()),
                     repair_body=self.cleanup['prompts'].get('repair_body', False))
                 # Cable subtraction can detach fragments after the first island
                 # pass. Filter those before recording changes or applying brushes.
@@ -152,8 +153,10 @@ def prepare_mask_editor(image, segmenter):
         prompts = dict(prompts)
         prompts.setdefault('protect', ['robot hand', 'black glove'])
         prompts.setdefault('background', ['wall', 'table'])
-        cleanup = dict(prompts=prompts,
-                       hands=segmenter.detect_objects(prompts['protect']),
+        hands = segmenter.detect_objects(prompts['protect'])
+        cleanup = dict(prompts=prompts, hands=hands,
+                       hand_patches=(segmenter.zoom_hands(initial, hands)
+                                     if prompts.get('zoom_hands', True) else []),
                        backgrounds=segmenter.detect_objects(prompts['background']),
                        additions=segmenter.detect_objects(prompts['include']),
                        strict_exclusions=(segmenter.detect_objects(prompts['strict_exclude'])

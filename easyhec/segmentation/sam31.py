@@ -176,6 +176,30 @@ class Sam31Segmenter:
             local.close()
         return objects
 
+    def zoom_hands(self, robot, hands, texts=('robot hand', 'robotic hand')):
+        """Re-segment each hand in a zoomed crop; return (region, mask) patches.
+
+        The full-frame prediction bridges finger gaps only a few pixels wide.
+        In a crop, 'robot hand' can select only a cable connector next to a
+        Wuji hand which 'robotic hand' finds; detections are filtered later.
+        """
+        from .image_cleanup import hand_crop_boxes, zoomed_hand_patch
+
+        patches = []
+        cropped = Sam31Segmenter(self.model, text=texts[0])
+        try:
+            boxes, coarse = hand_crop_boxes(robot, hands)
+            for x0, y0, x1, y1 in boxes:
+                cropped(self.image[y0:y1, x0:x1], [])
+                patch = zoomed_hand_patch(robot, (x0, y0, x1, y1),
+                                          cropped.detect_objects(list(texts)),
+                                          cropped.detect_objects(['robot']), coarse)
+                if patch is not None:
+                    patches.append(patch)
+        finally:
+            cropped.close()
+        return patches
+
     def _use_detected_mask_for_refinement(self):
         """Keep the text mask as the prior for the first click on this still.
 

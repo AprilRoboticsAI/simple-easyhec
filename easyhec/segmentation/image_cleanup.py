@@ -94,6 +94,99 @@ def cable_crop_boxes(robot, cables):
     return boxes[:6]
 
 
+def hand_crop_boxes(robot, hands):
+    """Zoom boxes around hands joined to the robot; overlapping detections share one.
+
+    A full-frame mask is predicted on a coarse grid and bridges finger gaps a
+    few pixels wide. Re-segmenting a crop raises the effective resolution.
+    Also returns the union of the hand detections used, the only pixels a
+    zoomed patch may change.
+    """
+    robot = np.asarray(robot, bool)
+    height, width = robot.shape
+    radius = max(1, round(48 * width / 1280))
+    near = cv2.dilate(robot.astype(np.uint8),
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2)) > 0
+    hands = [np.asarray(hand, bool) for hand in hands]
+    if any(hand.shape != robot.shape for hand in hands):
+        raise ValueError('Hand and robot dimensions must match')
+    candidates = []
+    for hand in hands:
+        if not (hand & near).any():
+            continue
+        x, y, w, h = cv2.boundingRect(hand.astype(np.uint8))
+        # Larger detections span several hands or the arm; a close hand
+        # already has enough pixels per finger gap.
+        if max(w, h) <= .3 * width:
+            candidates.append((hand, (x, y, w, h)))
+    # As in hand recovery: small detections are connectors or screen hands.
+    largest = max((hand.sum() for hand, _ in candidates), default=0)
+    boxes, used = [], np.zeros_like(robot)
+    for hand, (x, y, w, h) in candidates:
+        if hand.sum() < .1 * largest:
+            continue
+        used |= hand
+        side = max(w, h) * 1.4 + 32 * width / 1280
+        cx, cy = x + w/2, y + h/2
+        boxes.append([max(0, round(cx - side/2)), max(0, round(cy - side/2)),
+                      min(width, round(cx + side/2)), min(height, round(cy + side/2))])
+    merged = []
+    for box in sorted(boxes, key=lambda b: (b[2]-b[0]) * (b[3]-b[1]), reverse=True):
+        for other in merged:
+            ix = min(box[2], other[2]) - max(box[0], other[0])
+            iy = min(box[3], other[3]) - max(box[1], other[1])
+            if ix > 0 and iy > 0 and ix*iy >= .5 * (box[2]-box[0]) * (box[3]-box[1]):
+                other[:] = [min(box[0], other[0]), min(box[1], other[1]),
+                            max(box[2], other[2]), max(box[3], other[3])]
+                break
+        else:
+            merged.append(box)
+    return [tuple(box) for box in merged], used
+
+
+def zoomed_hand_patch(robot, box, hands, bodies, coarse_hands):
+    """Fine mask for one hand crop: zoomed hands, plus zoomed robot parts in their hull.
+
+    `hands` and `bodies` are crop-sized zoomed detections. Only hands mostly
+    on a full-frame hand detection, and bodies mostly on the full-frame robot,
+    are trusted: a zoomed prompt can select a nearby cable connector. The
+    patch changes only
+    pixels inside the hull that a full-frame hand detection (`coarse_hands`)
+    or the zoomed hand covers: the hull also reaches over the wrist and arm,
+    which the zoomed robot prompt does not reliably cover. Returns full-frame
+    (region, mask), or None when the crop found no hand.
+    """
+    robot = np.asarray(robot, bool)
+    x0, y0, x1, y1 = box
+    prior = robot[y0:y1, x0:x1]
+    coarse = np.asarray(coarse_hands, bool)[y0:y1, x0:x1]
+    hand = np.zeros_like(prior)
+    for mask in hands:
+        mask = np.asarray(mask, bool)
+        if mask.any() and np.count_nonzero(mask & coarse) >= .5 * mask.sum():
+            hand |= mask
+    if not hand.any():
+        return None
+    outline = np.zeros(prior.shape, np.uint8)
+    cv2.fillConvexPoly(outline, cv2.convexHull(cv2.findNonZero(hand.astype(np.uint8))), 1)
+    outline = outline > 0
+    hull = outline & (hand | coarse)
+    fine = hand.copy()
+    for mask in bodies:
+        mask = np.asarray(mask, bool)
+        if mask.any() and np.count_nonzero(mask & prior) >= .5 * mask.sum():
+            fine |= mask & hull
+    # Finger gaps lie between fingers. A removal touching the arm is the
+    # wrist adapter or cuff, which the zoomed hand prompt omits: keep it.
+    body = prior & ~outline
+    count, labels = cv2.connectedComponents((hull & prior & ~fine).astype(np.uint8), connectivity=8)
+    touching = np.unique(labels[cv2.dilate(body.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0])
+    hull &= ~np.isin(labels, touching[touching > 0])
+    region, mask = np.zeros_like(robot), np.zeros_like(robot)
+    region[y0:y1, x0:x1], mask[y0:y1, x0:x1] = hull, fine & hull
+    return region, mask
+
+
 def hand_envelopes(robot, hands):
     """Protect each selected robot hand's convex envelope, including finger gaps."""
     protected = np.zeros_like(robot, dtype=bool)
@@ -180,16 +273,26 @@ def repair_silhouette(foreground, excluded, protected=None):
 
 
 def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=False,
-                 backgrounds=(), repair_body=True, strict_exclusions=()):
+                 backgrounds=(), repair_body=True, strict_exclusions=(), hand_patches=()):
     """Add nearby parts and remove exposed cables while preserving existing gaps.
 
     Reject disconnected additions (e.g. objects on a monitor) and gross changes.
     These are review safeguards, not guarantees of segmentation correctness.
+    `hand_patches` are (region, mask) pairs from zoomed hand crops: inside each
+    region the zoomed mask replaces the coarse one, and stands in for the
+    full-frame hand detections it covers.
     """
     robot = np.asarray(robot, bool)
     if robot.ndim != 2:
         raise ValueError('Expected a 2D robot mask')
     result = robot.copy()
+    patches = [(np.asarray(region, bool), np.asarray(mask, bool)) for region, mask in hand_patches]
+    if patches:
+        covered = np.any([region for region, _ in patches], axis=0)
+        # A coarse detection mostly inside a zoomed hull is that same hand.
+        hands = [mask for _, mask in patches] + [
+            hand for hand in map(lambda h: np.asarray(h, bool), hands)
+            if np.count_nonzero(hand & covered) < .5 * max(1, hand.sum())]
     recovered = 0
     if recover_hands and len(hands):
         # A missing hand has little overlap with the robot prompt, but still
@@ -213,6 +316,10 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
             if area and area >= .1*largest and np.count_nonzero(hand & near_robot) >= max(4, .001*area):
                 recovered += int((hand & ~result).any())
                 result |= hand
+    patched = 0
+    for region, mask in patches:
+        patched += int((result[region] != mask[region]).sum())
+        result[region] = mask[region]
     hand_added = int((result & ~robot).sum())
     protected, hand_count = hand_envelopes(result, hands)
     added, removed = np.zeros_like(robot), np.zeros_like(robot)
@@ -267,6 +374,7 @@ def compose_mask(robot, additions=(), exclusions=(), hands=(), recover_hands=Fal
         strict_removed |= obj & result
     result &= ~strict_removed
     return result, dict(stats, protected_hands=hand_count, recovered_hands=recovered,
+                        zoomed_hands=len(patches), zoomed_hand_changed_px=patched,
                         strict_removed_px=int(strict_removed.sum()),
                         background_removed_px=int(background_removed.sum()),
                         hand_added_px=hand_added,
